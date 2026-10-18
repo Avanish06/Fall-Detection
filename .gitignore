@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+.venv/
+
+# Results / data (add your own CSVs manually)
+results/*.csv
+results/*.png
+
+# Arduino build artifacts
+build/
+*.elf
+*.bin
+*.hex
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
