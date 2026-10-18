@@ -233,7 +233,10 @@ const setTheta    = async (v) => {
   document.getElementById('sliderVal').textContent = v.toFixed(2);
   await fetch('/setTheta?v=' + v);
 };
-const exportData  = () => { window.open('/export', '_blank'); };
+const exportData  = () => {
+  // Use direct navigation to avoid popup blockers and trigger instant file download
+  window.location.href = '/export';
+};
 
 setInterval(refresh, 250);
 refresh();
@@ -285,24 +288,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/export":
             results_dir = os.path.join(os.path.dirname(__file__), "results")
             os.makedirs(results_dir, exist_ok=True)
-            export_path = os.path.join(results_dir, f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+            filename = f"fallguard_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            export_path = os.path.join(results_dir, filename)
+
             with state_lock:
                 hist_copy = list(telemetry_history)
 
-            with open(export_path, 'w', encoding='utf-8') as f:
-                f.write("timestamp_ms,mag,jerk,state,conf,activity,fallCount,nonFallCount,theta,impThresh,jerkThresh\n")
-                for row in hist_copy:
-                    f.write(",".join(map(str, row)) + "\n")
+            csv_text = "timestamp_ms,mag,jerk,state,conf,activity,fallCount,nonFallCount,theta,impThresh,jerkThresh\n"
+            for row in hist_copy:
+                csv_text += ",".join(map(str, row)) + "\n"
 
+            # 1. Save local copy on disk inside results/
+            try:
+                with open(export_path, 'w', encoding='utf-8') as f:
+                    f.write(csv_text)
+                print(f"[EXPORT] Saved {len(hist_copy)} records to: {export_path}")
+            except Exception as e:
+                print(f"[EXPORT ERROR] {e}")
+
+            # 2. Trigger browser download directly
             self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(f"Exported {len(hist_copy)} records to:\n{export_path}".encode('utf-8'))
+            self.wfile.write(csv_text.encode('utf-8'))
         else:
             self.send_response(404)
             self.end_headers()
 
     def log_message(self, format, *args):
+        # Suppress routine HTTP 200 logs to keep console clean
         pass
 
 def send_serial_cmd(cmd):
@@ -319,6 +335,7 @@ def parse_line(line):
     if not line:
         return
 
+    # Handle EVENT lines
     if line.startswith("EVENT,"):
         parts = line.split(",")
         msg = ",".join(parts[2:]) if len(parts) > 2 else line
@@ -330,6 +347,8 @@ def parse_line(line):
                 latest_state["events"].pop()
         return
 
+    # Handle TELEMETRY lines (New extended format)
+    # TELEMETRY,<ms>,<mag>,<jerk>,<stateStr>,<conf>,<activity>,<fallCount>,<nonFallCount>,<theta>,<impThresh>,<jerkThresh>
     if line.startswith("TELEMETRY,"):
         parts = line.split(",")
         if len(parts) >= 11:
@@ -366,6 +385,8 @@ def parse_line(line):
                 pass
         return
 
+    # Handle legacy DATA lines:
+    # DATA,<ms>,<mag>,<jerk>,<state>,<conf>,<activity>,<label>
     if line.startswith("DATA,"):
         parts = line.split(",")
         if len(parts) >= 7:
@@ -423,9 +444,11 @@ def find_esp32_port():
 if __name__ == "__main__":
     port = sys.argv[1] if len(sys.argv) > 1 else find_esp32_port()
 
+    # Start Serial Reader Thread
     t = threading.Thread(target=serial_reader_thread, args=(port,), daemon=True)
     t.start()
 
+    # Start HTTP Server on port 5000
     server_port = 5000
     server_address = ('127.0.0.1', server_port)
     httpd = HTTPServer(server_address, DashboardHandler)
@@ -438,6 +461,7 @@ if __name__ == "__main__":
     print("  Press Ctrl+C in this terminal to stop.")
     print("=" * 60)
 
+    # Open browser automatically after 1 second
     threading.Timer(1.0, lambda: webbrowser.open(url)).start()
 
     try:
