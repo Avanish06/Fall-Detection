@@ -758,7 +758,7 @@ const MAX_PTS = 150;
 const labels = [];
 const magData = [], jerkData = [], confData = [];
 
-function mkChart(id, datasets, yLabel) {
+const mkChart = (id, datasets, yLabel) => {
   return new Chart(document.getElementById(id), {
     type: 'line',
     data: { labels, datasets },
@@ -774,7 +774,7 @@ function mkChart(id, datasets, yLabel) {
       }
     }
   });
-}
+};
 
 const sigChart = mkChart('sigChart', [
   { label: 'Magnitude (m/s²)', data: magData,  borderColor: '#38bdf8', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
@@ -785,16 +785,16 @@ const confChart = mkChart('confChart', [
   { label: 'Classifier Conf', data: confData, borderColor: '#a78bfa', borderWidth: 1.5, pointRadius: 2, tension: 0.3, fill: { target: 'origin', above: 'rgba(167,139,250,.10)' } }
 ], 'P(FALL)');
 
-function push(arr, val) { arr.push(val); if (arr.length > MAX_PTS) arr.shift(); }
+const push = (arr, val) => { arr.push(val); if (arr.length > MAX_PTS) arr.shift(); };
 
-function stateClass(s) {
+const stateClass = (s) => {
   if (s.includes('ALERT')) return 's-danger';
   if (s.includes('FALL') || s.includes('Impact') || s.includes('Class')) return 's-warn';
   if (s.includes('Calib')) return 's-cal';
   return 's-normal';
-}
+};
 
-async function refresh() {
+const refresh = async () => {
   try {
     const r = await fetch('/data'); const d = await r.json();
     const t = new Date().toLocaleTimeString();
@@ -834,14 +834,14 @@ async function refresh() {
     document.getElementById('status').textContent = 'Connection lost...';
     document.getElementById('status').className = 'status s-danger';
   }
-}
+};
 
-async function cancelAlert() { await fetch('/cancel'); }
-async function ackAlert()    { await fetch('/ack'); }
-async function setTheta(v)   {
+const cancelAlert = async () => { await fetch('/cancel'); };
+const ackAlert    = async () => { await fetch('/ack'); };
+const setTheta    = async (v) => {
   document.getElementById('sliderVal').textContent = v.toFixed(2);
   await fetch('/setTheta?v=' + v);
-}
+};
 
 setInterval(refresh, 500);
 refresh();
