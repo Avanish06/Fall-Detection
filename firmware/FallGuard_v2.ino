@@ -68,7 +68,7 @@ const int    SMA_SIZE            = 5;
 
 // ─── Phase timings ──────────────────────────────────────────────────────────
 const float  FREE_FALL_MAG       = 5.0f;   // m/s² — downward acceleration dip (your fall dipped to ~3.5; sitting stays > 8.0)
-const unsigned long FF_MIN_MS    = 60;     // free-fall must last this long (60ms)
+const unsigned long FF_MIN_MS    = 40;     // free-fall must last this long (40ms / 2 samples at 50Hz)
 const unsigned long FF_WINDOW_MS = 1400;   // impact must follow within this window (1.4s)
 
 const float  STILL_LOW           = 7.5f;   // m/s² — stillness band widened slightly for bed/soft surfaces
@@ -160,10 +160,11 @@ String eventLog[LOG_SIZE];
 int    logHead = 0;
 
 // ─── Timing bookmarks ───────────────────────────────────────────────────────
-unsigned long ffStart       = 0;
-unsigned long impactTime    = 0;
-unsigned long confirmedTime = 0;
-unsigned long lastSampleMs  = 0;
+unsigned long ffStart        = 0;
+unsigned long impactTime     = 0;
+unsigned long stillnessStart = 0;
+unsigned long confirmedTime  = 0;
+unsigned long lastSampleMs   = 0;
 
 bool inFFDip = false;
 
@@ -232,6 +233,18 @@ void pushWindow(float mag, float jerk) {
   winJerk[winHead] = jerk;
   winHead = (winHead + 1) % WINDOW_SIZE;
   if (winHead == 0) winFull = true;
+}
+
+float getRecentMaxJerk(int ms = 150) {
+  int samples = (ms + SAMPLE_INTERVAL_MS - 1) / SAMPLE_INTERVAL_MS;
+  int available = winFull ? WINDOW_SIZE : winHead;
+  int count = (samples < available) ? samples : available;
+  float mxJ = 0.0f;
+  for (int i = 0; i < count; i++) {
+    int idx = (winHead - 1 - (i % WINDOW_SIZE) + 2 * WINDOW_SIZE) % WINDOW_SIZE;
+    if (winJerk[idx] > mxJ) mxJ = winJerk[idx];
+  }
+  return mxJ;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -439,9 +452,10 @@ void readButton() {
 
 void resetToNormal(String reason) {
   buzzerOff();
-  inFFDip    = false;
-  state      = NORMAL;
-  lastClassConf = -1.0f;
+  inFFDip        = false;
+  stillnessStart = 0;
+  state          = NORMAL;
+  lastClassConf  = -1.0f;
   logEvent(reason);
 }
 
@@ -484,7 +498,7 @@ void runFallDetection() {
   if (remoteCancelReq) {
     remoteCancelReq = false;
     if (state != NORMAL && state != CALIBRATING) {
-      if (lastClassConf >= 0) {
+      if (lastClassConf >= 0 || state == IMPACT) {
         updateClassStats(nonFallStats, lastFeatures);
         theta = fminf(THETA_MAX, theta + THETA_UP);
         logEvent("CANCEL_REMOTE theta=" + String(theta, 2));
@@ -517,8 +531,8 @@ void runFallDetection() {
       if (jerk    > calMaxJerk) calMaxJerk = jerk;
 
       if (millis() - calStart >= CAL_DURATION_MS) {
-        IMPACT_THRESHOLD = constrain(calMaxMag  * 1.25f, 11.5f, 25.0f);
-        JERK_THRESHOLD   = constrain(calMaxJerk * 1.30f, 220.0f, 600.0f);
+        IMPACT_THRESHOLD = constrain(calMaxMag  * 1.15f, 11.0f, 13.0f);
+        JERK_THRESHOLD   = constrain(calMaxJerk * 1.15f, 180.0f, 260.0f);
         state = NORMAL;
         // Play calibration done chirp
         for (int i=0; i<PAT_CAL_N; i++) {
@@ -539,6 +553,17 @@ void runFallDetection() {
     // ── NORMAL ────────────────────────────────────────────────────────────────
     case NORMAL: {
       buzzerOff();
+
+      // Direct high-jerk path (falls with minimal or soft free-fall dip, e.g., slip/trip)
+      if (jerk >= 280.0f && liveMag >= 11.5f) {
+        extractFeatures(lastFeatures);
+        impactTime     = millis();
+        stillnessStart = 0;
+        inFFDip        = false;
+        state          = IMPACT;
+        break;
+      }
+
       if (liveMag < FREE_FALL_MAG) {
         if (!inFFDip) { inFFDip = true; ffStart = millis(); }
         if (millis() - ffStart >= FF_MIN_MS) {
@@ -552,14 +577,14 @@ void runFallDetection() {
 
     // ── FREE_FALL ─────────────────────────────────────────────────────────────
     case FREE_FALL: {
-      // Waiting for impact: magnitude spike AND jerk spike
-      if (liveMag >= IMPACT_THRESHOLD && jerk >= JERK_THRESHOLD) {
-        // Both impact magnitude AND jerk confirmed — this is the key
-        // discriminator: jump landings rarely exceed JERK_THRESHOLD
-        state      = IMPACT;
-        impactTime = millis();
+      float recentMaxJerk = getRecentMaxJerk(150);
+      if (liveMag >= IMPACT_THRESHOLD && (jerk >= JERK_THRESHOLD || recentMaxJerk >= JERK_THRESHOLD)) {
+        extractFeatures(lastFeatures);
+        state          = IMPACT;
+        impactTime     = millis();
+        stillnessStart = 0;
+        inFFDip        = false;
       } else if (millis() - ffStart >= FF_WINDOW_MS) {
-        // No qualifying impact within window — false alarm (arm swing, etc.)
         resetToNormal("FF_TIMEOUT_NO_IMPACT");
         inFFDip = false;
       }
@@ -569,26 +594,28 @@ void runFallDetection() {
     // ── IMPACT ───────────────────────────────────────────────────────────────
     case IMPACT: {
       if (quickPress) {
-        // Early cancel during impact check
-        extractFeatures(lastFeatures);
         updateClassStats(nonFallStats, lastFeatures);
         theta = fminf(THETA_MAX, theta + THETA_UP);
         resetToNormal("CANCEL_USER_IMPACT");
         break;
       }
-      unsigned long elapsed = millis() - impactTime;
-      if (elapsed < STILL_MS) {
-        // Not yet enough stillness time — check if still
-        if (!isStill) impactTime = millis(); // reset stillness clock if they move
+
+      unsigned long timeSinceImpact = millis() - impactTime;
+
+      if (isStill) {
+        if (stillnessStart == 0) {
+          stillnessStart = millis();
+        }
+        if (millis() - stillnessStart >= STILL_MS) {
+          lastClassConf = classify(lastFeatures);
+          state = CANDIDATE_FALL;
+          break;
+        }
       } else {
-        // 2 seconds of sustained stillness after impact — candidate fall
-        extractFeatures(lastFeatures);
-        lastClassConf = classify(lastFeatures);
-        state = CANDIDATE_FALL;
+        stillnessStart = 0;
       }
-      // Failsafe: if moving around vigorously 5s after impact, reset
-      if (elapsed > 5000 && !isStill) {
-        extractFeatures(lastFeatures);
+
+      if (timeSinceImpact >= 5000 && !isStill) {
         updateClassStats(nonFallStats, lastFeatures);
         resetToNormal("IMPACT_TIMEOUT_MOVING");
       }
