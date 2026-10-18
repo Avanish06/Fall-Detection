@@ -463,11 +463,27 @@ void runFallDetection() {
 
   readButton();
 
-  // --- Remote cancel from dashboard ---
+  // Read USB Serial commands from laptop dashboard
+  while (Serial.available() > 0) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "CANCEL") {
+      remoteCancelReq = true;
+    } else if (cmd == "ACK") {
+      if (state == ALERT_SENT) {
+        resetToNormal("ALERT_ACKNOWLEDGED_SERIAL");
+      }
+    } else if (cmd.startsWith("SET_THETA ")) {
+      float v = cmd.substring(10).toFloat();
+      theta = constrain(v, THETA_MIN, THETA_MAX);
+      logEvent("THETA_SET_SERIAL=" + String(theta, 2));
+    }
+  }
+
+  // Remote cancel from dashboard
   if (remoteCancelReq) {
     remoteCancelReq = false;
     if (state != NORMAL && state != CALIBRATING) {
-      // Non-fall: feed features to classifier as NON_FALL
       if (lastClassConf >= 0) {
         updateClassStats(nonFallStats, lastFeatures);
         theta = fminf(THETA_MAX, theta + THETA_UP);
@@ -477,17 +493,19 @@ void runFallDetection() {
     }
   }
 
-  // ── Serial DATA line (every sample, during non-alert states) ──────────────
-  if (state == NORMAL || state == FREE_FALL || state == IMPACT) {
-    Serial.print("DATA,");
-    Serial.print(millis()); Serial.print(",");
-    Serial.print(liveMag,  2); Serial.print(",");
-    Serial.print(jerk,     1); Serial.print(",");
-    Serial.print(state);       Serial.print(",");
-    Serial.print(lastClassConf >= 0 ? lastClassConf : 0.0f, 3); Serial.print(",");
-    Serial.print(activityName()); Serial.print(",");
-    Serial.println("NORMAL");
-  }
+  // Stream real-time telemetry over USB Serial for laptop dashboard
+  Serial.print("TELEMETRY,");
+  Serial.print(millis()); Serial.print(",");
+  Serial.print(liveMag,  2); Serial.print(",");
+  Serial.print(jerk,     1); Serial.print(",");
+  Serial.print(stateStr());   Serial.print(",");
+  Serial.print(lastClassConf >= 0 ? lastClassConf : 0.0f, 3); Serial.print(",");
+  Serial.print(activityName()); Serial.print(",");
+  Serial.print(fallStats.count); Serial.print(",");
+  Serial.print(nonFallStats.count); Serial.print(",");
+  Serial.print(theta, 3); Serial.print(",");
+  Serial.print(IMPACT_THRESHOLD, 1); Serial.print(",");
+  Serial.println(JERK_THRESHOLD, 1);
 
   bool isStill = (liveMag >= STILL_LOW && liveMag <= STILL_HIGH);
 
