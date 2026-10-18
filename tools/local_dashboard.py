@@ -379,7 +379,7 @@ def parse_line(line):
                         "jerkThresh": jk
                     })
                     telemetry_history.append([ms, mag, jerk, state_str, conf, act, fc, nfc, th, imp, jk])
-                    if len(telemetry_history) > 2000:
+                    if len(telemetry_history) > 300000:
                         telemetry_history.pop(0)
             except Exception:
                 pass
@@ -407,7 +407,7 @@ def parse_line(line):
                     latest_state["conf"] = conf
                     latest_state["activity"] = act
                     telemetry_history.append([ms, mag, jerk, s_name, conf, act, 0, 0, 0.65, 22.0, 500.0])
-                    if len(telemetry_history) > 2000:
+                    if len(telemetry_history) > 300000:
                         telemetry_history.pop(0)
             except Exception:
                 pass
