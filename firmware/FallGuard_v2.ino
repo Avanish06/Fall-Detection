@@ -67,22 +67,22 @@ const int    WINDOW_SIZE         = 25;               // 500 ms window
 const int    SMA_SIZE            = 5;
 
 // ─── Phase timings ──────────────────────────────────────────────────────────
-const float  FREE_FALL_MAG       = 2.5f;   // m/s² — near-weightless threshold
-const unsigned long FF_MIN_MS    = 80;     // free-fall must last this long
-const unsigned long FF_WINDOW_MS = 1200;   // impact must follow within this window
+const float  FREE_FALL_MAG       = 5.0f;   // m/s² — downward acceleration dip (your fall dipped to ~3.5; sitting stays > 8.0)
+const unsigned long FF_MIN_MS    = 60;     // free-fall must last this long (60ms)
+const unsigned long FF_WINDOW_MS = 1400;   // impact must follow within this window (1.4s)
 
-const float  STILL_LOW           = 8.5f;   // m/s² — stillness band
-const float  STILL_HIGH          = 11.0f;
-const unsigned long STILL_MS     = 2000;   // must stay still this long
+const float  STILL_LOW           = 7.5f;   // m/s² — stillness band widened slightly for bed/soft surfaces
+const float  STILL_HIGH          = 12.0f;
+const unsigned long STILL_MS     = 1800;   // 1.8s sustained stillness
 
 const unsigned long CANCEL_MS    = 5000;   // user cancel window after confirm
 
 // ─── Jerk threshold (m/s³ at 50 Hz) ────────────────────────────────────────
-// Falls: jerk >> 500 m/s³; sit-downs / jump landings: jerk < 400 m/s³
-float JERK_THRESHOLD   = 500.0f;   // personalised after calibration
+// Falls: jerk > 220 m/s³; jumping: jerk <= 180 m/s³; sitting: jerk <= 100 m/s³
+float JERK_THRESHOLD   = 220.0f;
 
 // ─── Personal impact threshold (m/s²) ──────────────────────────────────────
-float IMPACT_THRESHOLD = 22.0f;    // default; overwritten after calibration
+float IMPACT_THRESHOLD = 11.5f;    // default; overwritten after calibration
 
 // ─── Adaptive confidence threshold θ ────────────────────────────────────────
 float theta = 0.65f;
@@ -517,9 +517,8 @@ void runFallDetection() {
       if (jerk    > calMaxJerk) calMaxJerk = jerk;
 
       if (millis() - calStart >= CAL_DURATION_MS) {
-        // Personal thresholds: 40% above the max observed during normal movement
-        IMPACT_THRESHOLD = constrain(calMaxMag  * 1.40f, 18.0f, 35.0f);
-        JERK_THRESHOLD   = constrain(calMaxJerk * 1.60f, 400.0f, 1200.0f);
+        IMPACT_THRESHOLD = constrain(calMaxMag  * 1.25f, 11.5f, 25.0f);
+        JERK_THRESHOLD   = constrain(calMaxJerk * 1.30f, 220.0f, 600.0f);
         state = NORMAL;
         // Play calibration done chirp
         for (int i=0; i<PAT_CAL_N; i++) {
