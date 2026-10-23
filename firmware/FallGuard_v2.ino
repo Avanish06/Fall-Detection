@@ -7,40 +7,11 @@
   Actuators: Passive buzzer, push button
   Network:   WiFi + HTTP web dashboard (Chart.js live graphs)
 
-  Architecture layers:
-    1. Signal Layer    — SMA filter, jerk, 25-sample sliding window
-    2. Feature Layer   — 6 discriminative features per window
-    3. Rule Engine     — Free-fall → Impact (jerk-gated) → Stillness FSM
-    4. Classifier      — Online Gaussian Naive Bayes (Welford's algorithm)
-    5. Activity Layer  — SITTING / WALKING / RUNNING inference
-    6. Adaptive Layer  — Confidence threshold θ updated from user feedback
-    7. Alert Layer     — Buzzer patterns + WiFi dashboard + event log
-
-  Key novelty:
-    • Jerk discriminator: falls produce a sharp jerk spike (>500 m/s³);
-      sitting/jumping produce smooth jerk (<300 m/s³) — rejected at rule-engine
-    • Online GNB uses Welford's running mean/variance: O(1) time, O(1) memory.
-      Classifier gets smarter every time the user confirms or cancels an event.
-    • Adaptive θ: false-alarm → θ rises (stricter); confirmed fall → θ falls
-      (more sensitive). Bounded to [0.50, 0.85].
-
   Wiring:
-    MPU6050  VCC → 3.3V    GND → GND
-             SDA → GPIO21  SCL → GPIO22
-    Buzzer   (+) → GPIO5   (-) → GND
-    Button       → GPIO2   (other leg → GND, INPUT_PULLUP)
-
-  Serial output (for logger.py) every SAMPLE_INTERVAL_MS during NORMAL mode:
-    "DATA,<ms>,<mag>,<jerk>,<phase>,<conf>,<activity>,<event>"
-  Event lines (on state transitions):
-    "EVENT,<ms>,FALL_CONFIRMED,<conf>"
-    "EVENT,<ms>,ALERT_SENT"
-    "EVENT,<ms>,CANCEL_USER"
-    "EVENT,<ms>,CANCEL_REMOTE"
-    "EVENT,<ms>,CALIBRATION_DONE,<threshold>,<jerkThresh>"
-
-  Author:  FallGuard Team
-  Version: 2.0.0
+    MPU6050  VCC -> 3.3V    GND -> GND
+             SDA -> GPIO21  SCL -> GPIO22
+    Buzzer   (+) -> GPIO5   (-) -> GND
+    Button       -> GPIO2   (other leg -> GND, INPUT_PULLUP)
   ============================================================
 */
 
@@ -49,117 +20,107 @@
 #include <Wire.h>
 #include <math.h>
 
-// ─── WiFi credentials ──────────────────────────────────────────────────────
+// --- WiFi credentials ------------------------------------------------------
 const char* WIFI_SSID     = "PingNaMileDubara";
 const char* WIFI_PASSWORD = "123avanish";
 
-// ─── Pin assignments ────────────────────────────────────────────────────────
+// --- Pin assignments --------------------------------------------------------
 const int MPU_ADDR   = 0x68;
 const int BUZZER_PIN = 5;
 const int BUTTON_PIN = 2;
 
-// ─── Sampling ───────────────────────────────────────────────────────────────
+// --- Sampling ---------------------------------------------------------------
 const int    SAMPLE_RATE_HZ      = 50;               // Hz
 const int    SAMPLE_INTERVAL_MS  = 1000 / SAMPLE_RATE_HZ; // 20 ms
 const int    WINDOW_SIZE         = 25;               // 500 ms window
 
-// ─── SMA filter ─────────────────────────────────────────────────────────────
+// --- SMA filter -------------------------------------------------------------
 const int    SMA_SIZE            = 5;
 
-// ─── Phase timings ──────────────────────────────────────────────────────────
-const float  FREE_FALL_MAG       = 5.0f;   // m/s² — downward acceleration dip (your fall dipped to ~3.5; sitting stays > 8.0)
-const unsigned long FF_MIN_MS    = 40;     // free-fall must last this long (40ms / 2 samples at 50Hz)
-const unsigned long FF_WINDOW_MS = 1400;   // impact must follow within this window (1.4s)
+// --- Phase timings ----------------------------------------------------------
+const float  FREE_FALL_MAG       = 5.0f;   // m/s^2 - downward acceleration dip
+const unsigned long FF_MIN_MS    = 40;     // free-fall must last 40ms (2 samples)
+const unsigned long FF_WINDOW_MS = 1400;   // impact must follow within this window
 
-const float  STILL_LOW           = 7.5f;   // m/s² — stillness band widened slightly for bed/soft surfaces
+const float  STILL_LOW           = 7.5f;   // m/s^2 - stillness band
 const float  STILL_HIGH          = 12.0f;
-const unsigned long STILL_MS     = 1800;   // 1.8s sustained stillness
+const unsigned long STILL_MS     = 2200;   // must stay still 2.2s (raised from 1800 to reject jumps/stumbles)
 
 const unsigned long CANCEL_MS    = 5000;   // user cancel window after confirm
 
-// ─── Jerk threshold (m/s³ at 50 Hz) ────────────────────────────────────────
-// Falls: jerk > 220 m/s³; jumping: jerk <= 180 m/s³; sitting: jerk <= 100 m/s³
+// --- Jerk threshold (m/s^3 at 50 Hz) ----------------------------------------
 float JERK_THRESHOLD   = 220.0f;
 
-// ─── Personal impact threshold (m/s²) ──────────────────────────────────────
-float IMPACT_THRESHOLD = 11.5f;    // default; overwritten after calibration
+// --- Personal impact threshold (m/s^2) --------------------------------------
+float IMPACT_THRESHOLD = 11.5f;
 
-// ─── Adaptive confidence threshold θ ────────────────────────────────────────
+// --- Adaptive confidence threshold theta ------------------------------------
 float theta = 0.65f;
 const float THETA_MAX  = 0.85f;
 const float THETA_MIN  = 0.50f;
-const float THETA_UP   = 0.02f;   // false-alarm → stricter
-const float THETA_DOWN = 0.01f;   // confirmed fall → slightly more sensitive
+const float THETA_UP   = 0.02f;
+const float THETA_DOWN = 0.01f;
 
-// ─── Calibration ────────────────────────────────────────────────────────────
+// --- Calibration ------------------------------------------------------------
 const unsigned long CAL_DURATION_MS = 20000; // 20 s
 float calMaxMag  = 0.0f;
 float calMaxJerk = 0.0f;
 unsigned long calStart = 0;
 
-// ─── State machine ──────────────────────────────────────────────────────────
+// --- State machine ----------------------------------------------------------
 enum FallState {
   CALIBRATING,
   NORMAL,
   FREE_FALL,
   IMPACT,
-  CANDIDATE_FALL,   // classifier is voting
-  FALL_CONFIRMED,   // 5-second cancel window
+  CANDIDATE_FALL,
+  FALL_CONFIRMED,
   ALERT_SENT
 };
 FallState state = CALIBRATING;
 
-// ─── Sliding window ─────────────────────────────────────────────────────────
+// --- Sliding window ---------------------------------------------------------
 float winMag[WINDOW_SIZE];
 float winJerk[WINDOW_SIZE];
 int   winHead    = 0;
 bool  winFull    = false;
 
-// ─── SMA filter ring buffer ──────────────────────────────────────────────────
+// --- SMA filter ring buffer --------------------------------------------------
 float smaBuffer[SMA_SIZE];
 int   smaHead    = 0;
 float smaSum     = 0.0f;
 
-// ─── Activity inference ─────────────────────────────────────────────────────
+// --- Activity inference -----------------------------------------------------
 enum Activity { ACT_STILL, ACT_WALKING, ACT_RUNNING };
 Activity currentActivity = ACT_STILL;
 
-// Rolling baseline for activity inference (Welford's, online)
 long  actCount = 0;
 float actMeanMag  = 9.81f;
 float actM2Mag    = 0.0f;
 float actVarMag   = 0.0f;
 
-// ─── Online Gaussian Naive Bayes classifier ─────────────────────────────────
-// Features (6):
-//  [0] mean_mag        — average magnitude in window
-//  [1] max_mag         — peak impact
-//  [2] min_mag         — free-fall dip
-//  [3] var_mag         — signal variance
-//  [4] peak_to_valley  — max_mag / max(min_mag, 0.1)
-//  [5] max_jerk        — sharpness of impact spike
+// --- Online Gaussian Naive Bayes classifier ---------------------------------
 const int N_FEATURES = 6;
 
 struct ClassStats {
   long  count;
   float mean[N_FEATURES];
-  float M2[N_FEATURES];     // sum of squared deviations (Welford)
-  float var[N_FEATURES];    // running variance
+  float M2[N_FEATURES];
+  float var[N_FEATURES];
 };
 
 ClassStats fallStats;
 ClassStats nonFallStats;
 
-// Classifier last result
-float lastClassConf = -1.0f; // -1 = not yet run
+float lastClassConf = -1.0f;
 float lastFeatures[N_FEATURES];
 
-// ─── Event log (ring buffer, last 12 events) ────────────────────────────────
+// --- Event log --------------------------------------------------------------
 const int LOG_SIZE = 12;
 String eventLog[LOG_SIZE];
 int    logHead = 0;
 
-// ─── Timing bookmarks ───────────────────────────────────────────────────────
+// --- Timing bookmarks -------------------------------------------------------
 unsigned long ffStart        = 0;
 unsigned long impactTime     = 0;
 unsigned long stillnessStart = 0;
@@ -168,7 +129,7 @@ unsigned long lastSampleMs   = 0;
 
 bool inFFDip = false;
 
-// ─── Button state ───────────────────────────────────────────────────────────
+// --- Button state -----------------------------------------------------------
 bool lastRaw = HIGH, debounced = HIGH;
 unsigned long debounceTs = 0;
 unsigned long pressStart = 0;
@@ -178,19 +139,18 @@ bool holdPress      = false;
 const unsigned long DEBOUNCE_MS   = 50;
 const unsigned long HOLD_PRESS_MS = 1500;
 
-// ─── Remote cancel (from dashboard) ────────────────────────────────────────
+// --- Remote cancel ----------------------------------------------------------
 volatile bool remoteCancelReq = false;
 
-// ─── Web server ─────────────────────────────────────────────────────────────
+// --- Web server -------------------------------------------------------------
 WebServer server(80);
 
-// ─── Live data for dashboard JSON ───────────────────────────────────────────
 float liveMag  = 9.81f;
 float liveJerk = 0.0f;
 
-// ════════════════════════════════════════════════════════════════════════════
-//  UTILITY — MPU6050 raw read
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+//  UTILITY - MPU6050 raw read
+// ============================================================================
 
 float readRawMagnitude() {
   Wire.beginTransmission(MPU_ADDR);
@@ -203,12 +163,12 @@ float readRawMagnitude() {
   float ax = rx / 16384.0f;
   float ay = ry / 16384.0f;
   float az = rz / 16384.0f;
-  return sqrtf(ax*ax + ay*ay + az*az) * 9.81f; // convert g → m/s²
+  return sqrtf(ax * ax + ay * ay + az * az) * 9.81f;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  SIGNAL LAYER — SMA filter + jerk
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+//  SIGNAL LAYER
+// ============================================================================
 
 float applySmoothing(float raw) {
   smaSum -= smaBuffer[smaHead];
@@ -218,16 +178,13 @@ float applySmoothing(float raw) {
   return smaSum / SMA_SIZE;
 }
 
-// Returns smoothed magnitude; updates global liveJerk
 float readSmoothed(float prevMag) {
   float raw     = readRawMagnitude();
   float smooth  = applySmoothing(raw);
-  // jerk = |Δmag / Δt|; Δt = SAMPLE_INTERVAL_MS / 1000
   liveJerk = fabsf(smooth - prevMag) / (SAMPLE_INTERVAL_MS / 1000.0f);
   return smooth;
 }
 
-// Push a sample into the sliding window
 void pushWindow(float mag, float jerk) {
   winMag[winHead]  = mag;
   winJerk[winHead] = jerk;
@@ -235,28 +192,28 @@ void pushWindow(float mag, float jerk) {
   if (winHead == 0) winFull = true;
 }
 
-float getRecentMaxJerk(int ms = 150) {
-  int samples = (ms + SAMPLE_INTERVAL_MS - 1) / SAMPLE_INTERVAL_MS;
+float getRecentMaxJerk(unsigned long ms) {
+  int count = ms / SAMPLE_INTERVAL_MS;
   int available = winFull ? WINDOW_SIZE : winHead;
-  int count = (samples < available) ? samples : available;
-  float mxJ = 0.0f;
+  if (count > available) count = available;
+  float maxJ = 0.0f;
   for (int i = 0; i < count; i++) {
     int idx = (winHead - 1 - (i % WINDOW_SIZE) + 2 * WINDOW_SIZE) % WINDOW_SIZE;
-    if (winJerk[idx] > mxJ) mxJ = winJerk[idx];
+    if (winJerk[idx] > maxJ) maxJ = winJerk[idx];
   }
-  return mxJ;
+  return maxJ;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  FEATURE LAYER — extract 6 features from current window
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+//  FEATURE LAYER
+// ============================================================================
 
 void extractFeatures(float feats[N_FEATURES]) {
   int n = winFull ? WINDOW_SIZE : winHead;
-  if (n < 2) { for (int i=0;i<N_FEATURES;i++) feats[i]=0; return; }
+  if (n < 2) { for (int i = 0; i < N_FEATURES; i++) feats[i] = 0; return; }
 
-  float sum=0, mx=-1e9f, mn=1e9f, mxJ=0;
-  for (int i=0; i<n; i++) {
+  float sum = 0, mx = -1e9f, mn = 1e9f, mxJ = 0;
+  for (int i = 0; i < n; i++) {
     sum += winMag[i];
     if (winMag[i]  > mx) mx  = winMag[i];
     if (winMag[i]  < mn) mn  = winMag[i];
@@ -265,9 +222,9 @@ void extractFeatures(float feats[N_FEATURES]) {
   float mean = sum / n;
 
   float varAcc = 0;
-  for (int i=0; i<n; i++) {
+  for (int i = 0; i < n; i++) {
     float d = winMag[i] - mean;
-    varAcc += d*d;
+    varAcc += d * d;
   }
   float var = varAcc / (n - 1);
 
@@ -275,32 +232,26 @@ void extractFeatures(float feats[N_FEATURES]) {
   feats[1] = mx;
   feats[2] = mn;
   feats[3] = var;
-  feats[4] = mx / fmaxf(mn, 0.1f);  // peak-to-valley ratio
-  feats[5] = mxJ;                   // max jerk in window
+  feats[4] = mx / fmaxf(mn, 0.1f);
+  feats[5] = mxJ;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  ONLINE GAUSSIAN NAIVE BAYES — Welford's incremental update
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+//  ONLINE GAUSSIAN NAIVE BAYES
+// ============================================================================
 
 void initClassStats(ClassStats& cs) {
   cs.count = 0;
-  for (int i=0; i<N_FEATURES; i++) {
+  for (int i = 0; i < N_FEATURES; i++) {
     cs.mean[i] = 0;
     cs.M2[i]   = 0;
-    cs.var[i]  = 1.0f; // small prior variance to avoid div-by-zero
+    cs.var[i]  = 1.0f;
   }
 }
 
-/**
- * Welford's Online Algorithm — incremental mean & variance update.
- * Mathematically equivalent to batch computation, O(1) time and space.
- * Reference: Welford, B.P. (1962). "Note on a method for calculating
- * corrected sums of squares and products." Technometrics, 4(3), 419-420.
- */
 void updateClassStats(ClassStats& cs, float feats[N_FEATURES]) {
   cs.count++;
-  for (int i=0; i<N_FEATURES; i++) {
+  for (int i = 0; i < N_FEATURES; i++) {
     float delta  = feats[i] - cs.mean[i];
     cs.mean[i]  += delta / cs.count;
     float delta2 = feats[i] - cs.mean[i];
@@ -309,47 +260,34 @@ void updateClassStats(ClassStats& cs, float feats[N_FEATURES]) {
   }
 }
 
-/**
- * Log-probability of feature vector given a class distribution.
- * Uses Gaussian assumption: P(x|C) = N(x; μ_C, σ²_C)
- * Computed in log-space for numerical stability.
- */
 float logProb(ClassStats& cs, float feats[N_FEATURES]) {
   if (cs.count < 2) return 0.0f;
-  // log prior: log P(C) ≈ log count_C / total
   float total = (float)(fallStats.count + nonFallStats.count + 1);
   float logP  = logf((float)cs.count / total + 1e-9f);
-  for (int i=0; i<N_FEATURES; i++) {
-    float var  = fmaxf(cs.var[i], 0.01f); // floor variance
+  for (int i = 0; i < N_FEATURES; i++) {
+    float var  = fmaxf(cs.var[i], 0.01f);
     float diff = feats[i] - cs.mean[i];
-    // log N(x; μ, σ²) = -0.5 * log(2πσ²) - (x-μ)² / (2σ²)
     logP -= 0.5f * logf(2.0f * M_PI * var);
     logP -= (diff * diff) / (2.0f * var);
   }
   return logP;
 }
 
-/**
- * Classify features. Returns P(FALL | features) in [0, 1].
- * If not enough training data, returns a prior of 0.75 to lean on
- * the rule engine (which already pre-filtered the event).
- */
 float classify(float feats[N_FEATURES]) {
   if (fallStats.count < 3 || nonFallStats.count < 3) {
-    return 0.75f; // insufficient data → trust rule engine
+    return 0.75f;
   }
   float logFall    = logProb(fallStats,    feats);
   float logNonFall = logProb(nonFallStats, feats);
-  // Numeric softmax: subtract max for stability
   float maxL    = fmaxf(logFall, logNonFall);
   float expFall = expf(logFall    - maxL);
   float expNF   = expf(logNonFall - maxL);
   return expFall / (expFall + expNF + 1e-9f);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  ACTIVITY INFERENCE — Welford's baseline on rolling magnitude
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+//  ACTIVITY INFERENCE
+// ============================================================================
 
 void updateActivityBaseline(float mag) {
   actCount++;
@@ -358,8 +296,7 @@ void updateActivityBaseline(float mag) {
   float delta2 = mag - actMeanMag;
   actM2Mag    += delta * delta2;
   actVarMag    = (actCount > 1) ? actM2Mag / (actCount - 1) : 0.0f;
-  // Infer activity from variance of the last rolling window
-  // High variance → vigorous movement; low → still
+
   if (actVarMag < 0.5f)       currentActivity = ACT_STILL;
   else if (actVarMag < 8.0f)  currentActivity = ACT_WALKING;
   else                        currentActivity = ACT_RUNNING;
@@ -374,39 +311,30 @@ String activityName() {
   return "UNKNOWN";
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  EVENT LOG
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+//  EVENT LOG & BUZZER
+// ============================================================================
 
 void logEvent(String msg) {
-  String entry = String(millis() / 1000) + "s — " + msg;
+  String entry = String(millis() / 1000) + "s - " + msg;
   eventLog[logHead] = entry;
   logHead = (logHead + 1) % LOG_SIZE;
   Serial.println("EVENT," + String(millis()) + "," + msg);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  BUZZER — non-blocking patterns
-// ════════════════════════════════════════════════════════════════════════════
-
-// cancelPattern: three short beeps then a long pause
 const unsigned long PAT_CANCEL[] = {150, 150, 150, 150, 150, 550};
 const int           PAT_CANCEL_N = 6;
-
-// alertPattern: long on, short off
 const unsigned long PAT_ALERT[]  = {500, 100};
 const int           PAT_ALERT_N  = 2;
-
-// calPattern: two quick chirps (played once)
 const unsigned long PAT_CAL[]    = {80, 80, 80, 500};
 const int           PAT_CAL_N    = 4;
 
 void playPattern(const unsigned long* pat, int n) {
   unsigned long period = 0;
-  for (int i=0; i<n; i++) period += pat[i];
+  for (int i = 0; i < n; i++) period += pat[i];
   unsigned long t = millis() % period;
   unsigned long acc = 0;
-  for (int i=0; i<n; i++) {
+  for (int i = 0; i < n; i++) {
     acc += pat[i];
     if (t < acc) {
       digitalWrite(BUZZER_PIN, (i % 2 == 0) ? HIGH : LOW);
@@ -417,9 +345,9 @@ void playPattern(const unsigned long* pat, int n) {
 
 void buzzerOff() { digitalWrite(BUZZER_PIN, LOW); }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  BUTTON — debounce + hold detection
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+//  BUTTON & RESET
+// ============================================================================
 
 void readButton() {
   quickPress = false;
@@ -430,7 +358,7 @@ void readButton() {
     if (raw != debounced) {
       debounced = raw;
       if (debounced == LOW) {
-        pressStart   = millis();
+        pressStart    = millis();
         holdTriggered = false;
       } else {
         unsigned long heldFor = millis() - pressStart;
@@ -438,17 +366,12 @@ void readButton() {
       }
     }
   }
-  if (debounced == LOW && !holdTriggered &&
-      millis() - pressStart >= HOLD_PRESS_MS) {
+  if (debounced == LOW && !holdTriggered && millis() - pressStart >= HOLD_PRESS_MS) {
     holdTriggered = true;
     holdPress     = true;
   }
   lastRaw = raw;
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-//  RESET
-// ════════════════════════════════════════════════════════════════════════════
 
 void resetToNormal(String reason) {
   buzzerOff();
@@ -459,25 +382,23 @@ void resetToNormal(String reason) {
   logEvent(reason);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 //  MAIN STATE MACHINE
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
 void runFallDetection() {
-  // --- Sample ---
   float prevMag = liveMag;
   liveMag  = readSmoothed(prevMag);
   float jerk = liveJerk;
   pushWindow(liveMag, jerk);
 
-  // --- Activity baseline (only during NORMAL to avoid polluting with fall data) ---
   if (state == NORMAL || state == CALIBRATING) {
     updateActivityBaseline(liveMag);
   }
 
   readButton();
 
-  // Read USB Serial commands from laptop dashboard
+  // Read USB Serial commands from dashboard
   while (Serial.available() > 0) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
@@ -494,7 +415,6 @@ void runFallDetection() {
     }
   }
 
-  // Remote cancel from dashboard
   if (remoteCancelReq) {
     remoteCancelReq = false;
     if (state != NORMAL && state != CALIBRATING) {
@@ -507,7 +427,7 @@ void runFallDetection() {
     }
   }
 
-  // Stream real-time telemetry over USB Serial for laptop dashboard
+  // Stream telemetry to USB Serial
   Serial.print("TELEMETRY,");
   Serial.print(millis()); Serial.print(",");
   Serial.print(liveMag,  2); Serial.print(",");
@@ -524,46 +444,34 @@ void runFallDetection() {
   bool isStill = (liveMag >= STILL_LOW && liveMag <= STILL_HIGH);
 
   switch (state) {
-
-    // ── CALIBRATING ──────────────────────────────────────────────────────────
     case CALIBRATING: {
       if (liveMag > calMaxMag)  calMaxMag  = liveMag;
       if (jerk    > calMaxJerk) calMaxJerk = jerk;
 
       if (millis() - calStart >= CAL_DURATION_MS) {
+        // Capped calibration bounds so routine movement cannot over-inflate thresholds
         IMPACT_THRESHOLD = constrain(calMaxMag  * 1.15f, 11.0f, 13.0f);
         JERK_THRESHOLD   = constrain(calMaxJerk * 1.15f, 180.0f, 260.0f);
         state = NORMAL;
-        // Play calibration done chirp
-        for (int i=0; i<PAT_CAL_N; i++) {
-          digitalWrite(BUZZER_PIN, (i%2==0) ? HIGH : LOW);
+        for (int i = 0; i < PAT_CAL_N; i++) {
+          digitalWrite(BUZZER_PIN, (i % 2 == 0) ? HIGH : LOW);
           delay(PAT_CAL[i]);
         }
         buzzerOff();
-        logEvent("CALIBRATION_DONE,impactThresh=" + String(IMPACT_THRESHOLD,1) +
-                 ",jerkThresh=" + String(JERK_THRESHOLD,1));
+        logEvent("CALIBRATION_DONE,impactThresh=" + String(IMPACT_THRESHOLD, 1) +
+                 ",jerkThresh=" + String(JERK_THRESHOLD, 1));
         Serial.println("EVENT," + String(millis()) +
                        ",CALIBRATION_DONE," +
-                       String(IMPACT_THRESHOLD,1) + "," +
-                       String(JERK_THRESHOLD,1));
+                       String(IMPACT_THRESHOLD, 1) + "," +
+                       String(JERK_THRESHOLD, 1));
       }
       break;
     }
 
-    // ── NORMAL ────────────────────────────────────────────────────────────────
     case NORMAL: {
       buzzerOff();
 
-      // Direct high-jerk path (falls with minimal or soft free-fall dip, e.g., slip/trip)
-      if (jerk >= 280.0f && liveMag >= 11.5f) {
-        extractFeatures(lastFeatures);
-        impactTime     = millis();
-        stillnessStart = 0;
-        inFFDip        = false;
-        state          = IMPACT;
-        break;
-      }
-
+      // Path 1: Standard Free-fall dip detection
       if (liveMag < FREE_FALL_MAG) {
         if (!inFFDip) { inFFDip = true; ffStart = millis(); }
         if (millis() - ffStart >= FF_MIN_MS) {
@@ -572,26 +480,34 @@ void runFallDetection() {
       } else {
         inFFDip = false;
       }
-      break;
-    }
 
-    // ── FREE_FALL ─────────────────────────────────────────────────────────────
-    case FREE_FALL: {
-      float recentMaxJerk = getRecentMaxJerk(150);
-      if (liveMag >= IMPACT_THRESHOLD && (jerk >= JERK_THRESHOLD || recentMaxJerk >= JERK_THRESHOLD)) {
-        extractFeatures(lastFeatures);
-        state          = IMPACT;
+      // Path 2: Direct High-Jerk Trigger (for sudden slips/trips without sustained zero-g dip)
+      if (jerk >= 280.0f && liveMag >= 11.5f) {
+        extractFeatures(lastFeatures); // Snapshot impact pulse immediately
         impactTime     = millis();
         stillnessStart = 0;
         inFFDip        = false;
-      } else if (millis() - ffStart >= FF_WINDOW_MS) {
-        resetToNormal("FF_TIMEOUT_NO_IMPACT");
-        inFFDip = false;
+        state          = IMPACT;
       }
       break;
     }
 
-    // ── IMPACT ───────────────────────────────────────────────────────────────
+    case FREE_FALL: {
+      // Use 150ms rolling peak jerk to eliminate phase mismatch between jerk and magnitude
+      float recentMaxJerk = getRecentMaxJerk(150);
+
+      if (liveMag >= IMPACT_THRESHOLD && (jerk >= JERK_THRESHOLD || recentMaxJerk >= JERK_THRESHOLD)) {
+        extractFeatures(lastFeatures); // Snapshot impact pulse immediately
+        impactTime     = millis();
+        stillnessStart = 0;
+        inFFDip        = false;
+        state          = IMPACT;
+      } else if (millis() - ffStart >= FF_WINDOW_MS) {
+        resetToNormal("FF_TIMEOUT_NO_IMPACT");
+      }
+      break;
+    }
+
     case IMPACT: {
       if (quickPress) {
         updateClassStats(nonFallStats, lastFeatures);
@@ -602,19 +518,19 @@ void runFallDetection() {
 
       unsigned long timeSinceImpact = millis() - impactTime;
 
+      // Independent Stillness Timer
       if (isStill) {
-        if (stillnessStart == 0) {
-          stillnessStart = millis();
-        }
+        if (stillnessStart == 0) stillnessStart = millis();
         if (millis() - stillnessStart >= STILL_MS) {
-          lastClassConf = classify(lastFeatures);
+          lastClassConf = classify(lastFeatures); // Classify the snapshotted impact
           state = CANDIDATE_FALL;
           break;
         }
       } else {
-        stillnessStart = 0;
+        stillnessStart = 0; // Reset stillness clock if moving
       }
 
+      // Movement Failsafe: if actively moving 5s after impact, reset to normal
       if (timeSinceImpact >= 5000 && !isStill) {
         updateClassStats(nonFallStats, lastFeatures);
         resetToNormal("IMPACT_TIMEOUT_MOVING");
@@ -622,11 +538,8 @@ void runFallDetection() {
       break;
     }
 
-    // ── CANDIDATE_FALL ────────────────────────────────────────────────────────
     case CANDIDATE_FALL: {
-      // Classifier vote already in lastClassConf
       if (lastClassConf >= theta) {
-        // Classifier agrees with rule engine → confirm fall
         state         = FALL_CONFIRMED;
         confirmedTime = millis();
         logEvent("FALL_CONFIRMED,conf=" + String(lastClassConf, 3) +
@@ -634,8 +547,6 @@ void runFallDetection() {
         Serial.println("EVENT," + String(millis()) +
                        ",FALL_CONFIRMED," + String(lastClassConf, 3));
       } else {
-        // Rule engine triggered but classifier disagrees
-        // → log as ambiguous non-fall, update classifier, reset
         updateClassStats(nonFallStats, lastFeatures);
         theta = fminf(THETA_MAX, theta + THETA_UP * 0.5f);
         resetToNormal("CLASSIFIER_REJECTED,conf=" + String(lastClassConf, 3));
@@ -643,11 +554,9 @@ void runFallDetection() {
       break;
     }
 
-    // ── FALL_CONFIRMED ────────────────────────────────────────────────────────
     case FALL_CONFIRMED: {
       playPattern(PAT_CANCEL, PAT_CANCEL_N);
       if (quickPress) {
-        // User cancelled → definitely a false alarm
         updateClassStats(nonFallStats, lastFeatures);
         theta = fminf(THETA_MAX, theta + THETA_UP);
         logEvent("CANCEL_USER,theta=" + String(theta, 2));
@@ -655,9 +564,7 @@ void runFallDetection() {
         break;
       }
       if (millis() - confirmedTime >= CANCEL_MS) {
-        // No cancel → escalate to alert
         state = ALERT_SENT;
-        // Update classifier: confirmed fall
         updateClassStats(fallStats, lastFeatures);
         theta = fmaxf(THETA_MIN, theta - THETA_DOWN);
         logEvent("ALERT_SENT,theta=" + String(theta, 2) +
@@ -668,10 +575,8 @@ void runFallDetection() {
       break;
     }
 
-    // ── ALERT_SENT ────────────────────────────────────────────────────────────
     case ALERT_SENT: {
       playPattern(PAT_ALERT, PAT_ALERT_N);
-      // Hold button to acknowledge and reset
       if (holdPress) {
         resetToNormal("ALERT_ACKNOWLEDGED");
       }
@@ -680,27 +585,26 @@ void runFallDetection() {
   }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  WEB DASHBOARD — HTML with Chart.js live plot
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+//  WEB DASHBOARD
+// ============================================================================
 
 String stateStr() {
   switch (state) {
-    case CALIBRATING:    return "Calibrating — sit/stand/walk normally";
+    case CALIBRATING:    return "Calibrating - sit/stand/walk normally";
     case NORMAL:         return "Normal";
     case FREE_FALL:      return "Free-fall detected...";
-    case IMPACT:         return "Impact detected — checking stillness...";
+    case IMPACT:         return "Impact detected - checking stillness...";
     case CANDIDATE_FALL: return "Classifying...";
-    case FALL_CONFIRMED: return "FALL CONFIRMED — press button to cancel";
-    case ALERT_SENT:     return "ALERT SENT — hold button to acknowledge";
+    case FALL_CONFIRMED: return "FALL CONFIRMED - press button to cancel";
+    case ALERT_SENT:     return "ALERT SENT - hold button to acknowledge";
   }
   return "Unknown";
 }
 
 String buildEventLogJSON() {
   String out = "[";
-  // Collect non-empty entries in order
-  for (int i=0; i<LOG_SIZE; i++) {
+  for (int i = 0; i < LOG_SIZE; i++) {
     int idx = (logHead - 1 - i + LOG_SIZE) % LOG_SIZE;
     if (eventLog[idx].length() == 0) continue;
     if (out.length() > 1) out += ",";
@@ -710,7 +614,6 @@ String buildEventLogJSON() {
   return out;
 }
 
-// Dashboard HTML — embedded in PROGMEM to save RAM
 const char DASHBOARD[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -740,21 +643,17 @@ const char DASHBOARD[] PROGMEM = R"rawliteral(
     .btn-ack{background:#1d4ed8}.btn-ack:hover{background:#1e40af}
     input[type=range]{width:100%;accent-color:#38bdf8}
     .theta-val{font-size:1.1rem;font-weight:700;color:#38bdf8;margin-left:8px}
-    .badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:.7rem;font-weight:700;margin-left:8px}
-    .b-still{background:#334155;color:#94a3b8}
-    .b-walk{background:#14532d;color:#4ade80}
-    .b-run{background:#7c2d12;color:#fb923c}
   </style>
 </head>
 <body>
-<h1>⛑ FallGuard v2 — Live Dashboard</h1>
+<h1>FallGuard v2 - Live Dashboard</h1>
 
 <div class="grid">
   <div class="card"><div class="label">Status</div>
     <div class="status" id="status">Loading...</div></div>
-  <div class="card"><div class="label">Acceleration (m/s²)</div>
+  <div class="card"><div class="label">Acceleration (m/s2)</div>
     <div class="value" id="accel">--</div></div>
-  <div class="card"><div class="label">Jerk (m/s³)</div>
+  <div class="card"><div class="label">Jerk (m/s3)</div>
     <div class="value" id="jerk">--</div></div>
   <div class="card"><div class="label">Classifier Confidence</div>
     <div class="value" id="conf">--</div></div>
@@ -762,14 +661,14 @@ const char DASHBOARD[] PROGMEM = R"rawliteral(
     <div class="value" id="activity">--</div></div>
   <div class="card"><div class="label">Falls Learned / Non-Falls</div>
     <div class="value" id="counts">--</div></div>
-  <div class="card"><div class="label">Adaptive Threshold θ</div>
+  <div class="card"><div class="label">Adaptive Threshold theta</div>
     <div class="value" id="theta">--</div></div>
   <div class="card"><div class="label">Impact / Jerk Thresholds</div>
     <div class="value" id="thresholds" style="font-size:1rem">--</div></div>
 </div>
 
 <div class="chart-card">
-  <div class="label" style="margin-bottom:10px">Live Signal — Magnitude &amp; Jerk</div>
+  <div class="label" style="margin-bottom:10px">Live Signal - Magnitude &amp; Jerk</div>
   <canvas id="sigChart"></canvas>
 </div>
 
@@ -784,7 +683,7 @@ const char DASHBOARD[] PROGMEM = R"rawliteral(
 </div>
 
 <div class="card" style="margin-bottom:12px">
-  <div class="label">Manual θ Nudge (drag to adjust classifier sensitivity)</div>
+  <div class="label">Manual theta Nudge (adjust sensitivity)</div>
   <div style="display:flex;align-items:center;margin-top:10px">
     <input type="range" id="thetaSlider" min="50" max="85" value="65"
            oninput="setTheta(this.value/100)">
@@ -793,8 +692,8 @@ const char DASHBOARD[] PROGMEM = R"rawliteral(
 </div>
 
 <div class="row">
-  <button onclick="cancelAlert()">🚫 Cancel / False Alarm</button>
-  <button class="btn-ack" onclick="ackAlert()">✅ Acknowledge Alert</button>
+  <button onclick="cancelAlert()">Cancel / False Alarm</button>
+  <button class="btn-ack" onclick="ackAlert()">Acknowledge Alert</button>
 </div>
 
 <script>
@@ -821,9 +720,9 @@ const mkChart = (id, datasets, yLabel) => {
 };
 
 const sigChart = mkChart('sigChart', [
-  { label: 'Magnitude (m/s²)', data: magData,  borderColor: '#38bdf8', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
-  { label: 'Jerk /10 (m/s³)', data: jerkData, borderColor: '#fb923c', borderWidth: 1.5, pointRadius: 0, tension: 0.3 }
-], 'm/s²');
+  { label: 'Magnitude (m/s2)', data: magData,  borderColor: '#38bdf8', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
+  { label: 'Jerk /10 (m/s3)', data: jerkData, borderColor: '#fb923c', borderWidth: 1.5, pointRadius: 0, tension: 0.3 }
+], 'm/s2');
 
 const confChart = mkChart('confChart', [
   { label: 'Classifier Conf', data: confData, borderColor: '#a78bfa', borderWidth: 1.5, pointRadius: 2, tension: 0.3, fill: { target: 'origin', above: 'rgba(167,139,250,.10)' } }
@@ -844,7 +743,7 @@ const refresh = async () => {
     const t = new Date().toLocaleTimeString();
     push(labels, t);
     push(magData,  d.mag);
-    push(jerkData, d.jerk / 10); // scaled for readability
+    push(jerkData, d.jerk / 10);
     push(confData, d.conf >= 0 ? d.conf : null);
     sigChart.update('none');
     confChart.update('none');
@@ -862,15 +761,13 @@ const refresh = async () => {
     document.getElementById('thresholds').textContent =
       'Impact: ' + d.impThresh.toFixed(1) + ' | Jerk: ' + d.jerkThresh.toFixed(0);
 
-    // Sync slider if remote changed theta
     if (!document.getElementById('thetaSlider').matches(':active')) {
       document.getElementById('thetaSlider').value = Math.round(d.theta * 100);
       document.getElementById('sliderVal').textContent = d.theta.toFixed(2);
     }
 
-    // Event log
     let logHtml = '';
-    d.log.forEach((e,i) => {
+    d.log.forEach((e) => {
       logHtml += `<div class="log-entry">${e}</div>`;
     });
     document.getElementById('logList').innerHTML = logHtml;
@@ -894,16 +791,15 @@ refresh();
 </html>
 )rawliteral";
 
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 //  WEB SERVER HANDLERS
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
 void handleRoot() {
   server.send_P(200, "text/html", DASHBOARD);
 }
 
 void handleData() {
-  // Collect recent event log entries
   String evJSON = buildEventLogJSON();
 
   String json = "{";
@@ -928,7 +824,6 @@ void handleCancel() {
 }
 
 void handleAck() {
-  // Same as hold-button: acknowledge after alert
   if (state == ALERT_SENT) {
     resetToNormal("ALERT_ACKNOWLEDGED_REMOTE");
   }
@@ -944,49 +839,33 @@ void handleSetTheta() {
   server.send(200, "text/plain", "OK");
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 //  SETUP
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
 void setup() {
   Serial.begin(115200);
   Serial.println("\n=== FallGuard v2 Booting ===");
 
-  // Pins
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   buzzerOff();
 
-  // Init SMA buffer
-  for (int i=0; i<SMA_SIZE;    i++) smaBuffer[i]   = 9.81f;
+  for (int i = 0; i < SMA_SIZE; i++) smaBuffer[i] = 9.81f;
   smaSum = 9.81f * SMA_SIZE;
 
-  // Init sliding window
-  for (int i=0; i<WINDOW_SIZE; i++) { winMag[i]=9.81f; winJerk[i]=0; }
+  for (int i = 0; i < WINDOW_SIZE; i++) { winMag[i] = 9.81f; winJerk[i] = 0; }
 
-  // Init event log
-  for (int i=0; i<LOG_SIZE; i++) eventLog[i] = "";
+  for (int i = 0; i < LOG_SIZE; i++) eventLog[i] = "";
 
-  // Init classifier
   initClassStats(fallStats);
   initClassStats(nonFallStats);
 
-  // MPU6050 — wake up (register 0x6B = 0)
   Wire.begin(21, 22);
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x6B);
   Wire.write(0x00);
   Wire.endTransmission(true);
-
-  // Optional: set accelerometer range to ±8g (register 0x1C = 0x10)
-  // This gives better headroom for detecting high-impact falls
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x1C);
-  Wire.write(0x10); // AFS_SEL = 2 → ±8g → scale = 4096 LSB/g
-  Wire.endTransmission(true);
-  // NOTE: if using ±8g range, update readRawMagnitude divisor from 16384 → 4096
-  // For ±2g (default, divisor 16384) comment out the block above.
-  // Default ±2g is fine for most falls; use ±8g for athletic/heavy users.
 
   Serial.print("Connecting to WiFi");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -997,10 +876,9 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nWiFi connected! Dashboard: http://" + WiFi.localIP().toString());
   } else {
-    Serial.println("\nWiFi failed — running offline (buzzer only)");
+    Serial.println("\nWiFi failed - running offline (buzzer only)");
   }
 
-  // Web routes
   server.on("/",         handleRoot);
   server.on("/data",     handleData);
   server.on("/cancel",   handleCancel);
@@ -1008,21 +886,18 @@ void setup() {
   server.on("/setTheta", handleSetTheta);
   server.begin();
 
-  // Begin calibration
   calStart = millis();
   state    = CALIBRATING;
   Serial.println("\n=== CALIBRATION PHASE (20 seconds) ===");
   Serial.println("Please sit down, stand up, and walk a few steps.");
-  Serial.println("The system is recording your personal movement baseline.");
   Serial.println("FORMAT: DATA,<ms>,<mag>,<jerk>,<phase>,<conf>,<activity>,<label>");
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 //  LOOP
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
 void loop() {
-  // Maintain 50 Hz sampling rate
   unsigned long now = millis();
   if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {
     lastSampleMs = now;
