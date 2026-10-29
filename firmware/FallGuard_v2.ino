@@ -101,8 +101,10 @@ enum FallState {
 };
 FallState state = CALIBRATING;
 
-// --- Part E: Telemetry & Performance Tracking ---
+// --- Part E & C: Telemetry, Performance & Adaptive Tracking ---
 float E_k = 1.0f;
+float a_peak = 0.0f;
+float J_peak = 0.0f;
 String currentTrialId = "";
 unsigned long lastStatPrintMs = 0;
 unsigned long statLoopCount = 0;
@@ -501,6 +503,8 @@ void resetToNormal(String reason) {
   calDoneBuzzerActive = false;
   inFFDip        = false;
   stillnessStart = 0;
+  a_peak         = 0.0f;
+  J_peak         = 0.0f;
 #if USE_INTEGRITY
   stillnessAccumMs = 0;
 #endif
@@ -682,6 +686,8 @@ void runFallDetection(unsigned long dt_us) {
         extractFeatures(lastFeatures); // Snapshot impact pulse immediately
 #endif
         impactTime     = millis();
+        a_peak         = liveMag;
+        J_peak         = jerk;
         stillnessStart = 0;
 #if USE_INTEGRITY
         stillnessAccumMs = 0;
@@ -702,6 +708,8 @@ void runFallDetection(unsigned long dt_us) {
         extractFeatures(lastFeatures); // Snapshot impact pulse immediately
 #endif
         impactTime     = millis();
+        a_peak         = liveMag;
+        J_peak         = (jerk > recentMaxJerk) ? jerk : recentMaxJerk;
         stillnessStart = 0;
 #if USE_INTEGRITY
         stillnessAccumMs = 0;
@@ -723,7 +731,16 @@ void runFallDetection(unsigned long dt_us) {
         break;
       }
 
+      if (liveMag > a_peak) a_peak = liveMag;
+      if (jerk > J_peak)    J_peak = jerk;
+
       unsigned long timeSinceImpact = millis() - impactTime;
+
+#if USE_ADAPTIVE
+      unsigned long current_still_ms = (unsigned long)(1500.0f + 1500.0f * (E_k / (E_k + E0)));
+#else
+      unsigned long current_still_ms = STILL_MS;
+#endif
 
       // Independent Stillness Timer
 #if USE_INTEGRITY
@@ -731,7 +748,7 @@ void runFallDetection(unsigned long dt_us) {
       if (dt_ms == 0) dt_ms = SAMPLE_INTERVAL_MS;
       if (current_vk > 0.5f && isStill) {
         stillnessAccumMs += dt_ms;
-        if (stillnessAccumMs >= STILL_MS) {
+        if (stillnessAccumMs >= current_still_ms) {
 #if USE_GNB
           lastClassConf = classify(lastFeatures); // Classify the snapshotted impact
           state = CANDIDATE_FALL;
@@ -750,7 +767,7 @@ void runFallDetection(unsigned long dt_us) {
 #else
       if (isStill) {
         if (stillnessStart == 0) stillnessStart = millis();
-        if (millis() - stillnessStart >= STILL_MS) {
+        if (millis() - stillnessStart >= current_still_ms) {
 #if USE_GNB
           lastClassConf = classify(lastFeatures); // Classify the snapshotted impact
           state = CANDIDATE_FALL;
@@ -821,7 +838,15 @@ void runFallDetection(unsigned long dt_us) {
         resetToNormal("CANCEL_USER");
         break;
       }
-      if (millis() - confirmedTime >= CANCEL_MS) {
+#if USE_ADAPTIVE
+      float m = fminf(a_peak / IMPACT_THRESHOLD, J_peak / JERK_THRESHOLD);
+      float m_clip = constrain((m - 1.0f) / 0.5f, 0.0f, 1.0f);
+      unsigned long current_cancel_ms = (unsigned long)(8000.0f - 5000.0f * m_clip);
+#else
+      unsigned long current_cancel_ms = CANCEL_MS;
+#endif
+
+      if (millis() - confirmedTime >= current_cancel_ms) {
         state = ALERT_SENT;
 #if USE_GNB
         theta = fmaxf(THETA_MIN, theta - THETA_DOWN);
