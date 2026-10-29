@@ -12,6 +12,7 @@ secrets.h
 # Results / data (add your own CSVs manually)
 results/*.csv
 results/*.png
+data/
 
 # Arduino build artifacts
 build/

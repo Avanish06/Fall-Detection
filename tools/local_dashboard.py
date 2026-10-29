@@ -14,7 +14,9 @@ Features:
 - Trial Protocol Engine: Pre-flight safety check, 3-2-1 countdown, spacebar onset marker.
 - Explicit Clock Reference: Latency and onset strictly computed via PC wall clock.
 - Strict Event Logic: 'detected' set only on confirmed fall; 'sensor_fault' only on SENSOR_FAULT.
-- Guided Session Planner: Timed trial sequence with rest intervals.
+- Orphan Alert Tracking: Events outside trial logged to 'orphan_alerts' column.
+- Persistent ACK Loop: Sends ACK every 500 ms until Normal (15s timeout) post-trial.
+- Enforced Fall Window: Minimum 12 s duration for fall trials.
 - Data Persistence: Autosaves to data/pilotN/ matching tools/analyze_trials.py schema.
 - Replay Mode: Simulated serial feed (--replay) clearly marked NOT LIVE.
 - Safety Guardrails: Confirmation modals for classifier-altering commands.
@@ -58,6 +60,14 @@ active_port_name = "AUTO"
 serial_inst = None
 stop_threads = False
 
+# Post-Trial ACK Loop State
+ack_loop_active = False
+ack_timeout_warning = None
+
+# Orphan Alert Surveillance
+orphan_alerts_since_last_trial = 0
+in_orphan_alert_state = False
+
 # Connection Health Metrics
 connection_status = "disconnected"  # "connected" | "no_data" | "disconnected"
 last_telemetry_time = 0.0
@@ -99,6 +109,8 @@ latest_state = {
     "adaptiveTc": 5000,
     "events": [],
     "lastTrialSummary": None,
+    "ackLoopActive": False,
+    "ackWarning": None,
 }
 
 # Rolling Ring Buffer for Canvas Visualization (stores [time_s, mag, jerk])
@@ -409,6 +421,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       margin-top: 8px;
     }
 
+    .ack-status-box {
+      display: none;
+      background: #1e1b4b;
+      color: #c7d2fe;
+      border: 1px solid #6366f1;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 0.75rem;
+      margin-top: 6px;
+      animation: pulseAlert 1.2s infinite alternate;
+    }
+
     .timeline-box {
       max-height: 180px;
       overflow-y: auto;
@@ -595,12 +619,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <span id="pfConn" class="pf-fail">FAIL (No USB)</span>
           </div>
           <div class="preflight-item">
-            <span>Sample Rate (45–55 Hz):</span>
+            <span>Sample Rate (42–58 Hz):</span>
             <span id="pfHz" class="pf-fail">FAIL (0.0 Hz)</span>
           </div>
           <div class="preflight-item">
-            <span>Calibration Complete:</span>
-            <span id="pfCal" class="pf-fail">FAIL (Pending)</span>
+            <span>Device State (Normal):</span>
+            <span id="pfCal" class="pf-fail">FAIL (Not Normal)</span>
           </div>
           <div class="preflight-item">
             <span>IMU Sensor Health (Q &ge; 0.50):</span>
@@ -676,8 +700,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
         </div>
 
-        <label>Trial Duration (s)</label>
-        <input type="number" id="trialDuration" value="10" min="4" max="60">
+        <label>Trial Duration (s) — <span id="durHint" style="color:var(--accent)">Falls &ge; 12s</span></label>
+        <input type="number" id="trialDuration" value="12" min="12" max="60">
 
         <div style="background:var(--bg-input);padding:6px 10px;border-radius:4px;margin-bottom:8px;font-size:0.75rem">
           Next Trial ID: <strong id="trialIdPreview" style="color:var(--accent)">P01_FALL_FWD_01</strong>
@@ -691,6 +715,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           [SPACE] Fall Movement Onset Recorded (PC Clock)!
         </div>
 
+        <!-- ACK Persistent Clearance Status -->
+        <div id="ackStatusBox" class="ack-status-box">
+          <div style="font-weight:bold" id="ackTitle">Clearing Alarm State...</div>
+          <div id="ackDetail">Sending ACK every 500 ms until device state is Normal...</div>
+        </div>
+
         <!-- Post-Trial Outcome Summary Card -->
         <div id="trialSummaryCard" class="trial-summary-box">
           <div style="font-weight:bold;margin-bottom:4px" id="sumTitle">Trial Outcome:</div>
@@ -698,6 +728,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div>Sensor Fault: <strong id="sumFault">--</strong></div>
           <div>Latency: <strong id="sumLatency">--</strong></div>
           <div>Samples Captured: <strong id="sumSamples">--</strong></div>
+          <div>Preceding Orphan Alerts: <strong id="sumOrphans">0</strong></div>
         </div>
 
         <div style="margin-top:10px;font-size:0.72rem;color:var(--text-muted)">
@@ -785,7 +816,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const toY = (v) => h - 20 - ((v - yMin) / (yMax - yMin)) * (h - 35);
       const toX = (t) => 35 + ((t - minSec) / chartWindowSeconds) * (w - 45);
 
-      // Grid Lines
       ctx.strokeStyle = '#1e293b';
       ctx.lineWidth = 1;
       ctx.fillStyle = '#64748b';
@@ -872,7 +902,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const data = cachedTelemetry;
       const connPass = data.connection === 'connected';
       const hzPass = data.liveHz >= 42.0 && data.liveHz <= 58.0;
-      const calPass = !data.state.toLowerCase().includes('calibrat');
+      const stateLower = data.state.toLowerCase();
+      const statePass = stateLower.includes('normal') && !stateLower.includes('calibrat') && !stateLower.includes('alert') && !stateLower.includes('fall');
       const faultPass = data.sensorState !== 'FAULT' && data.Q >= 0.50;
 
       const pfConn = document.getElementById('pfConn');
@@ -884,8 +915,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       pfHz.className = hzPass ? 'pf-pass' : 'pf-fail';
 
       const pfCal = document.getElementById('pfCal');
-      pfCal.textContent = calPass ? 'PASS (Normal)' : 'FAIL (Calibrating)';
-      pfCal.className = calPass ? 'pf-pass' : 'pf-fail';
+      pfCal.textContent = statePass ? 'PASS (Normal)' : `FAIL (${data.state})`;
+      pfCal.className = statePass ? 'pf-pass' : 'pf-fail';
 
       const pfFault = document.getElementById('pfFault');
       pfFault.textContent = faultPass ? `PASS (Q=${data.Q.toFixed(2)})` : `FAIL (Fault Q=${data.Q.toFixed(2)})`;
@@ -894,7 +925,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const msg = document.getElementById('preflightStatusMsg');
       const btn = document.getElementById('btnRecord');
 
-      if (connPass && hzPass && calPass && faultPass) {
+      if (connPass && hzPass && statePass && faultPass) {
         preflightPassed = true;
         btn.disabled = false;
         btn.textContent = '▶ Record Trial (Ready)';
@@ -904,7 +935,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         preflightPassed = false;
         btn.disabled = true;
         btn.textContent = '▶ Record Trial (Pass Pre-Flight First)';
-        msg.textContent = '❌ Pre-flight failed. Resolve hardware errors above.';
+        msg.textContent = '❌ Pre-flight failed. State must be Normal and hardware healthy.';
         msg.style.color = 'var(--red)';
       }
     }
@@ -922,7 +953,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const data = await res.json();
         cachedTelemetry = data;
 
-        // Invalidate preflight if critical fault occurs during operation
+        // Invalidate preflight if connection drops or fault occurs
         if (preflightPassed && (data.connection !== 'connected' || data.sensorState === 'FAULT')) {
           preflightPassed = false;
           const btn = document.getElementById('btnRecord');
@@ -934,7 +965,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           document.getElementById('preflightStatusMsg').style.color = 'var(--amber)';
         }
 
-        // Connection Chip
         const dot = document.getElementById('connDot');
         const txt = document.getElementById('connText');
         dot.className = 'dot dot-' + data.connection;
@@ -1019,13 +1049,32 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     function onActivityChange() {
       const sel = document.getElementById('activitySelect');
+      const isFall = sel.selectedOptions[0].getAttribute('data-fall') === 'true';
+      const durInput = document.getElementById('trialDuration');
+      const hint = document.getElementById('durHint');
+
       document.getElementById('customActRow').style.display = sel.value === 'OTHER' ? 'block' : 'none';
+
+      // Enforce minimum 12s trial window for fall trials so device has time to confirm
+      if (isFall) {
+        durInput.min = "12";
+        if (parseInt(durInput.value, 10) < 12) {
+          durInput.value = "12";
+        }
+        hint.textContent = "Falls ≥ 12s enforced";
+        hint.style.color = "var(--accent)";
+      } else {
+        durInput.min = "4";
+        hint.textContent = "ADL standard";
+        hint.style.color = "var(--text-muted)";
+      }
+
       updateTrialIdPreview();
     }
 
     function startTrialCountdown() {
-      if (!preflightPassed) {
-        alert('Recording is blocked: Please run and pass Pre-Flight Surveillance first.');
+      if (!preflightPassed || !cachedTelemetry || !cachedTelemetry.state.toLowerCase().includes('normal')) {
+        alert('Recording is blocked: Device state must be Normal and Pre-Flight check must pass.');
         return;
       }
       if (trialRecordingActive) return;
@@ -1040,6 +1089,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       onsetMarked = false;
       document.getElementById('onsetAlert').style.display = 'none';
       document.getElementById('trialSummaryCard').style.display = 'none';
+      document.getElementById('ackStatusBox').style.display = 'none';
 
       let count = 3;
       digit.textContent = count;
@@ -1065,7 +1115,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const trialId = document.getElementById('trialIdPreview').textContent;
       const sel = document.getElementById('activitySelect');
       const isFall = sel.selectedOptions[0].getAttribute('data-fall') === 'true';
-      const durSec = parseInt(document.getElementById('trialDuration').value, 10) || 10;
+      let durSec = parseInt(document.getElementById('trialDuration').value, 10) || 12;
+      if (isFall && durSec < 12) durSec = 12;
+
       const part = document.getElementById('partId').value.trim() || 'P01';
       const placement = document.getElementById('placementSelect').value;
       const orientation = document.getElementById('orientSelect').value;
@@ -1087,7 +1139,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
 
     function runTrialTimer() {
-      const durSec = parseInt(document.getElementById('trialDuration').value, 10) || 10;
+      const sel = document.getElementById('activitySelect');
+      const isFall = sel.selectedOptions[0].getAttribute('data-fall') === 'true';
+      let durSec = parseInt(document.getElementById('trialDuration').value, 10) || 12;
+      if (isFall && durSec < 12) durSec = 12;
+
       const digit = document.getElementById('countdownDigit');
       const sub = document.getElementById('countdownSub');
       let remain = durSec;
@@ -1109,10 +1165,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     async function finishTrial() {
       trialRecordingActive = false;
+      // Pre-flight check is strictly invalidated upon trial finish
+      preflightPassed = false;
+      const btn = document.getElementById('btnRecord');
+      btn.disabled = true;
+      btn.textContent = '▶ Record Trial (Pass Pre-Flight First)';
+
       const res = await fetch('/api/trial/end', { method: 'POST' });
       const summary = await res.json();
 
-      // Display trial results on-screen
+      // Display on-screen trial outcome
       const sumCard = document.getElementById('trialSummaryCard');
       sumCard.style.display = 'block';
       document.getElementById('sumTitle').textContent = `Outcome for ${summary.trial_id}:`;
@@ -1122,11 +1184,48 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       document.getElementById('sumFault').style.color = summary.sensor_fault ? '#c084fc' : '#4ade80';
       document.getElementById('sumLatency').textContent = summary.latency_ms ? `${summary.latency_ms} ms (${summary.latency_ref})` : 'N/A';
       document.getElementById('sumSamples').textContent = summary.samples;
+      document.getElementById('sumOrphans').textContent = summary.orphan_alerts;
 
-      // Re-enable record button if preflight still valid
-      document.getElementById('btnRecord').disabled = !preflightPassed;
+      // Start Post-Trial ACK Clearance Monitor
+      monitorPostTrialAck();
+
       trialCounter++;
       updateTrialIdPreview();
+    }
+
+    function monitorPostTrialAck() {
+      const ackBox = document.getElementById('ackStatusBox');
+      const ackTitle = document.getElementById('ackTitle');
+      const ackDetail = document.getElementById('ackDetail');
+      ackBox.style.display = 'block';
+
+      const pollAck = setInterval(async () => {
+        try {
+          const res = await fetch('/api/device/ack_status');
+          const data = await res.json();
+
+          if (data.in_progress) {
+            ackTitle.textContent = 'Clearing Alarms (ACK Loop Active)...';
+            ackDetail.textContent = `Sending ACK every 500ms... Current device state: ${data.state}`;
+          } else {
+            clearInterval(pollAck);
+            if (data.warning) {
+              ackTitle.textContent = '⚠️ Alarm Clearance Warning';
+              ackDetail.textContent = data.warning;
+              ackBox.style.borderColor = 'var(--red)';
+              ackBox.style.color = '#fecaca';
+            } else {
+              ackTitle.textContent = '✅ Device State Returned to Normal';
+              ackDetail.textContent = 'Alarms cleared. Verifying pre-flight conditions...';
+              ackBox.style.borderColor = 'var(--green)';
+              ackBox.style.color = '#dcfce7';
+              runPreflightCheck();
+            }
+          }
+        } catch (e) {
+          clearInterval(pollAck);
+        }
+      }, 400);
     }
 
     // Spacebar Onset Marker (Strictly PC Wall Clock)
@@ -1150,7 +1249,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     function planGuidedSession() {
       const mins = parseInt(document.getElementById('sessionLenMin').value, 10) || 15;
       const totalSec = mins * 60;
-      const trialBlockSec = 10 + 8;
+      const trialBlockSec = 12 + 8;
       const totalTrials = Math.max(4, Math.floor(totalSec / trialBlockSec));
 
       const fallTypes = ['FALL_FORWARD', 'FALL_BACKWARD', 'FALL_LATERAL', 'FALL_DIAG', 'FALL_WALK'];
@@ -1179,6 +1278,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
 
     function executeGuidedStep() {
+      if (!preflightPassed) {
+        alert('Cannot start next guided trial: Device must be Normal and Pre-Flight check must pass.');
+        return;
+      }
       if (guidedIndex >= guidedQueue.length) return;
       const act = guidedQueue[guidedIndex];
       document.getElementById('activitySelect').value = act;
@@ -1290,9 +1393,34 @@ def send_serial_cmd(cmd: str):
                 print(f"[SERIAL WRITE ERROR] {e}")
 
 
+def ack_until_normal_worker():
+    """Keeps sending ACK every 500 ms until device state is Normal (timeout 15s)."""
+    global ack_loop_active, ack_timeout_warning
+    ack_loop_active = True
+    ack_timeout_warning = None
+    start_t = time.time()
+
+    print("[ACK LOOP] Initiating post-trial alarm clearance loop...")
+    while time.time() - start_t < 15.0:
+        with state_lock:
+            st = latest_state["state"].strip().lower()
+        if "normal" in st and "calibrat" not in st and "alert" not in st and "fall" not in st:
+            ack_loop_active = False
+            print("[ACK LOOP] Device successfully returned to Normal state.")
+            return
+
+        send_serial_cmd("ACK\n")
+        time.sleep(0.5)
+
+    ack_loop_active = False
+    ack_timeout_warning = "Device did not return to Normal state within 15 seconds. Please press device button or reset."
+    print(f"[ACK WARNING] {ack_timeout_warning}")
+
+
 def parse_telemetry_line(line: str):
     """Parse incoming firmware telemetry lines matching the v2 protocol."""
     global latest_state, last_telemetry_time, sample_timestamps, live_hz, active_trial
+    global orphan_alerts_since_last_trial, in_orphan_alert_state
 
     now = time.time()
     last_telemetry_time = now
@@ -1332,9 +1460,14 @@ def parse_telemetry_line(line: str):
             if len(latest_state["events"]) > 50:
                 latest_state["events"].pop()
 
-            # Record sensor_fault if SENSOR_FAULT event arrives during trial
-            if active_trial is not None and "SENSOR_FAULT" in msg:
-                active_trial["sensor_fault"] = True
+            if active_trial is not None:
+                if "SENSOR_FAULT" in msg:
+                    active_trial["sensor_fault"] = True
+            else:
+                # Orphan event outside active trial window
+                if "ALERT_SENT" in msg or "FALL_CONFIRMED" in msg:
+                    orphan_alerts_since_last_trial += 1
+                    print(f"[ORPHAN EVENT] Alert event outside trial: {msg} (Total orphans: {orphan_alerts_since_last_trial})")
         return
 
     # Extended Telemetry Line:
@@ -1359,8 +1492,12 @@ def parse_telemetry_line(line: str):
                 e_val = float(parts[14]) if len(parts) > 14 else 0.0
                 sensor_st = parts[15].strip() if len(parts) > 15 else "OK"
 
-                # Arrival timestamp strictly from PC wall clock
                 now_wall_ms = int(now * 1000)
+
+                is_alert_state = (
+                    "FALL_CONFIRMED" in state_str or "ALERT_SENT" in state_str or 
+                    state_str.startswith("FALL CONFIRMED") or state_str.startswith("ALERT SENT")
+                )
 
                 with state_lock:
                     latest_state.update({
@@ -1384,14 +1521,11 @@ def parse_telemetry_line(line: str):
                     })
 
                     # Trial Surveillance Rules:
-                    # 1. 'detected' set ONLY on FALL_CONFIRMED or ALERT_SENT
-                    # 2. 'sensor_fault' set ONLY on SENSOR_FAULT
-                    # 3. Detection timing strictly from PC clock (now_wall_ms)
+                    # 1. 'detected' set ONLY during active trial by FALL_CONFIRMED or ALERT_SENT
+                    # 2. Alerts outside active trial are logged as orphan_alerts
                     if active_trial is not None:
                         active_trial["samples"] += 1
-
-                        if ("FALL_CONFIRMED" in state_str or "ALERT_SENT" in state_str or 
-                            state_str.startswith("FALL CONFIRMED") or state_str.startswith("ALERT SENT")):
+                        if is_alert_state:
                             active_trial["detected"] = True
                             if active_trial["detect_wall_ms"] is None:
                                 active_trial["detect_wall_ms"] = now_wall_ms  # PC Clock
@@ -1402,6 +1536,15 @@ def parse_telemetry_line(line: str):
                         active_trial["samples_data"].append([
                             active_trial["trial_id"], now_wall_ms, ms, mag, jerk, state_str, conf, act, q_val, e_val
                         ])
+                    else:
+                        # Outside active trial window: monitor orphan alert transitions
+                        if is_alert_state:
+                            if not in_orphan_alert_state:
+                                in_orphan_alert_state = True
+                                orphan_alerts_since_last_trial += 1
+                                print(f"[ORPHAN ALERT] Alert outside trial: {state_str} (Total orphans: {orphan_alerts_since_last_trial})")
+                        else:
+                            in_orphan_alert_state = False
             except Exception:
                 pass
 
@@ -1525,6 +1668,21 @@ class OfflineDashboardHandler(BaseHTTPRequestHandler):
                 copy_state = dict(latest_state)
             self.wfile.write(json.dumps(copy_state).encode("utf-8"))
 
+        elif path == "/api/device/ack_status":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            with state_lock:
+                st = latest_state["state"]
+                is_norm = ("normal" in st.lower() and "calibrat" not in st.lower() and "alert" not in st.lower() and "fall" not in st.lower())
+                resp = {
+                    "in_progress": ack_loop_active,
+                    "warning": ack_timeout_warning,
+                    "state": st,
+                    "isNormal": is_norm,
+                }
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
+
         elif path == "/api/ports":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1546,7 +1704,7 @@ class OfflineDashboardHandler(BaseHTTPRequestHandler):
         content_len = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_len).decode("utf-8") if content_len > 0 else ""
 
-        global active_port_name, active_trial, pilot_dir
+        global active_port_name, active_trial, pilot_dir, orphan_alerts_since_last_trial
 
         if path == "/api/ports/switch":
             port = params.get("port", ["AUTO"])[0]
@@ -1603,6 +1761,10 @@ class OfflineDashboardHandler(BaseHTTPRequestHandler):
             ori = data.get("orientation", "front")
             dur = float(data.get("duration_s", 10.0))
 
+            # Enforce minimum 12 seconds for fall trials
+            if is_f:
+                dur = max(12.0, dur)
+
             send_serial_cmd(f"TRIAL,{tid}\n")
             cue_ms = int(time.time() * 1000)  # PC Clock
 
@@ -1632,14 +1794,12 @@ class OfflineDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/trial/mark_onset":
             with state_lock:
                 if active_trial is not None and active_trial["onset_wall_ms"] is None:
-                    # Explicitly using PC system clock for movement onset
                     active_trial["onset_wall_ms"] = int(time.time() * 1000)
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"OK")
 
         elif path == "/api/trial/end":
-            send_serial_cmd("ACK\n")
             send_serial_cmd("TRIAL,\n")
 
             with state_lock:
@@ -1654,6 +1814,9 @@ class OfflineDashboardHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
 
+            # Start persistent ACK loop in background
+            threading.Thread(target=ack_until_normal_worker, daemon=True).start()
+
             # Latency strictly computed via PC wall clock difference
             latency_ms = ""
             latency_ref = "none"
@@ -1663,6 +1826,9 @@ class OfflineDashboardHandler(BaseHTTPRequestHandler):
                     latency_ms = str(diff)
                     latency_ref = "onset_marker"
 
+            orphans_to_log = orphan_alerts_since_last_trial
+            orphan_alerts_since_last_trial = 0  # Reset for next trial
+
             summary = {
                 "trial_id": tr["trial_id"],
                 "detected": tr["detected"],
@@ -1670,6 +1836,7 @@ class OfflineDashboardHandler(BaseHTTPRequestHandler):
                 "latency_ms": latency_ms,
                 "latency_ref": latency_ref,
                 "samples": tr["samples"],
+                "orphan_alerts": orphans_to_log,
             }
 
             with state_lock:
@@ -1684,11 +1851,11 @@ class OfflineDashboardHandler(BaseHTTPRequestHandler):
                 write_header = not trials_csv.exists()
                 with open(trials_csv, "a", encoding="utf-8") as f:
                     if write_header:
-                        f.write("trial_id,participant,key,activity,is_fall,placement,orientation,cue_wall_ms,onset_wall_ms,duration_s,samples,detected,sensor_fault,latency_ms,latency_ref\n")
+                        f.write("trial_id,participant,key,activity,is_fall,placement,orientation,cue_wall_ms,onset_wall_ms,duration_s,samples,detected,sensor_fault,latency_ms,latency_ref,orphan_alerts\n")
                     f.write(
                         f"{tr['trial_id']},{tr['participant']},{tr['key']},{tr['activity']},{tr['is_fall']},{tr['placement']},{tr['orientation']},"
                         f"{tr['cue_wall_ms']},{tr['onset_wall_ms'] or ''},{tr['duration_s']},{tr['samples']},{tr['detected']},{tr['sensor_fault']},"
-                        f"{latency_ms},{latency_ref}\n"
+                        f"{latency_ms},{latency_ref},{orphans_to_log}\n"
                     )
 
                 samples_csv = pilot_dir / "samples.csv"
@@ -1699,7 +1866,7 @@ class OfflineDashboardHandler(BaseHTTPRequestHandler):
                     for s in tr["samples_data"]:
                         f.write(",".join(map(str, s)) + "\n")
 
-                print(f"[AUTOSAVE] Saved {tr['trial_id']} ({tr['samples']} samples) to {pilot_dir.name}/")
+                print(f"[AUTOSAVE] Saved {tr['trial_id']} ({tr['samples']} samples, {orphans_to_log} orphan alerts) to {pilot_dir.name}/")
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1732,7 +1899,6 @@ def main():
     verify_offline_compliance(DASHBOARD_HTML)
 
     active_port_name = args.port
-    # Note: pilot_dir is kept None until an actual trial is saved, keeping data/ clean
 
     # Step 2: Serial / Replay Thread Launch
     if args.replay:

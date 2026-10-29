@@ -81,10 +81,13 @@ Before any trial can be recorded, the **Pre-Flight Surveillance Engine** must pa
 - **Placements:** `waist` (belt/default), `chest`, `thigh`, `pocket`, `wrist`.
 - **Orientations:** `front`, `side`, `back`, `rotated 90`.
 
-### D. Detection & Fault Logic
-- `'detected'` is set to `True` **strictly** if `FALL_CONFIRMED` or `ALERT_SENT` arrives during the active trial window. Intermediate candidate states do not trigger detection.
+### D. Detection, Orphan Alerts & Post-Trial Clearance
+- `'detected'` is set to `True` **strictly** if `FALL_CONFIRMED` or `ALERT_SENT` arrives during the active trial window.
+- **Orphan Alert Surveillance**: Any `FALL_CONFIRMED` or `ALERT_SENT` event arriving outside an active trial is ignored when computing `detected` and is instead logged into the `orphan_alerts` column of `trials.csv`.
+- **Persistent ACK Clearance Loop**: Upon trial completion, the dashboard automatically sends `ACK` every 500 ms until the firmware state returns to `Normal` (with a 15 s timeout and alert banner if clearing fails). The countdown and next trial are blocked until the state is confirmed `Normal` and the pre-flight check passes again.
+- **Minimum 12 s Fall Window**: For all fall trials (`is_fall = true`), the trial window is strictly clamped to $\ge 12\text{ s}$ to guarantee adequate duration for kinematic impact, post-impact stillness (`STILL_MS = 2200 ms`), and Bayesian classification confirmation.
 - `'sensor_fault'` is set to `True` **strictly** if `SENSOR_FAULT` is triggered during the trial window.
-- Both status counts are displayed in an outcome card on-screen immediately when each trial concludes.
+- Outcome card on-screen displays `detected`, `sensor_fault`, `latency`, `samples`, and `orphan_alerts` immediately after each trial.
 
 ---
 
@@ -96,5 +99,5 @@ data/
     ├── trials.csv   <- Discrete trial records (schema matches tools/analyze_trials.py)
     └── samples.csv  <- 50 Hz timeseries telemetry
 ```
-- **`trials.csv` columns:** `trial_id, participant, key, activity, is_fall, placement, orientation, cue_wall_ms, onset_wall_ms, duration_s, samples, detected, sensor_fault, latency_ms, latency_ref`
+- **`trials.csv` columns:** `trial_id, participant, key, activity, is_fall, placement, orientation, cue_wall_ms, onset_wall_ms, duration_s, samples, detected, sensor_fault, latency_ms, latency_ref, orphan_alerts`
 - **`samples.csv` columns:** `trial_id, wall_ms, device_ms, mag, jerk, state, conf, activity, Q, E`
