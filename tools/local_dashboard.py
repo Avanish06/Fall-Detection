@@ -11,9 +11,11 @@ Features:
 - USB Connection Surveillance: Auto-detect, manual port select, hotplug reconnect.
 - Real-Time Telemetry: 50 Hz kinematic visualization with kinematic threshold lines.
 - Sensor Integrity Monitoring: Live Q index gauge, motion energy E, SENSOR_FAULT banner.
-- Trial Protocol Engine: 3-2-1 countdown, trial ID generation, spacebar onset marker.
+- Trial Protocol Engine: Pre-flight safety check, 3-2-1 countdown, spacebar onset marker.
+- Explicit Clock Reference: Latency and onset strictly computed via PC wall clock.
+- Strict Event Logic: 'detected' set only on confirmed fall; 'sensor_fault' only on SENSOR_FAULT.
 - Guided Session Planner: Timed trial sequence with rest intervals.
-- Data Persistence: Autosave to data/pilotN/ matching tools/analyze_trials.py schema.
+- Data Persistence: Autosaves to data/pilotN/ matching tools/analyze_trials.py schema.
 - Replay Mode: Simulated serial feed (--replay) clearly marked NOT LIVE.
 - Safety Guardrails: Confirmation modals for classifier-altering commands.
 """
@@ -96,19 +98,20 @@ latest_state = {
     "adaptiveTs": 2200,
     "adaptiveTc": 5000,
     "events": [],
+    "lastTrialSummary": None,
 }
 
-# Rolling Ring Buffer for Canvas Visualization (stores [time_s, mag, jerk, conf])
-CHART_BUFFER_SIZE = 1800  # Up to 36 seconds at 50 Hz
+# Rolling Ring Buffer for Canvas Visualization (stores [time_s, mag, jerk])
+CHART_BUFFER_SIZE = 1800
 chart_buffer = []
 
-# Pilot Session Management
+# Pilot Session Management (lazily initialized on first real trial save)
 pilot_dir = None
-active_trial = None  # None or dict representing running trial
+active_trial = None
 
 
 def get_or_create_pilot_dir(requested_pilot: str | None = None) -> Path:
-    """Determine and create data/pilotN/ directory, never using 'test/fake/synthetic'."""
+    """Determine and create data/pilotN/ directory, strictly avoiding 'test/fake/synthetic'."""
     data_root = Path(__file__).parent.parent / "data"
     data_root.mkdir(parents=True, exist_ok=True)
 
@@ -116,7 +119,6 @@ def get_or_create_pilot_dir(requested_pilot: str | None = None) -> Path:
         clean_name = re.sub(r"[^a-zA-Z0-9_\-]", "", requested_pilot.strip())
         target = data_root / clean_name
     else:
-        # Auto-detect highest pilot index
         existing = [
             d.name for d in data_root.iterdir()
             if d.is_dir() and re.match(r"^pilot\d+$", d.name)
@@ -206,7 +208,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     h1 { font-size: 1.35rem; font-weight: 700; color: var(--accent); display: flex; align-items: center; gap: 6px; }
     .header-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
-    /* Chips and Badges */
     .chip {
       display: inline-flex;
       align-items: center;
@@ -236,7 +237,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       letter-spacing: 0.5px;
     }
 
-    /* Buzzer Banners */
     .alarm-banner {
       display: none;
       padding: 14px 18px;
@@ -252,10 +252,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .banner-fault { background: #581c87; color: #f3e8ff; border: 2px solid #c084fc; }
     @keyframes pulseAlert { from { opacity: 0.85; transform: scale(0.995); } to { opacity: 1; transform: scale(1.0); } }
 
-    /* Layout Grids */
     .dashboard-grid {
       display: grid;
-      grid-template-columns: 1fr 340px;
+      grid-template-columns: 1fr 350px;
       gap: 14px;
     }
     @media (max-width: 980px) {
@@ -281,7 +280,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       align-items: center;
     }
 
-    /* Metrics Grid */
     .metrics-row {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
@@ -297,7 +295,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .metric-lbl { font-size: 0.65rem; color: var(--text-muted); text-transform: uppercase; font-weight: 600; }
     .metric-val { font-size: 1.25rem; font-weight: 700; color: var(--accent); }
 
-    /* Canvas Chart */
     .chart-container {
       position: relative;
       width: 100%;
@@ -327,7 +324,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     .btn-toggle.active { background: var(--accent); color: #000; font-weight: 700; border-color: var(--accent); }
 
-    /* Forms & Inputs */
     label { font-size: 0.75rem; color: var(--text-muted); display: block; margin-bottom: 3px; font-weight: 600; }
     select, input[type="text"], input[type="number"] {
       width: 100%;
@@ -355,12 +351,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       transition: opacity 0.15s;
     }
     button:hover { opacity: 0.9; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
     .btn-primary { background: var(--accent); color: #000; }
     .btn-danger { background: var(--red); color: #fff; }
     .btn-success { background: var(--green); color: #000; }
     .btn-secondary { background: var(--bg-input); border: 1px solid var(--border-color); color: var(--text-main); }
 
-    /* Trial Recorder Block */
     .countdown-overlay {
       display: none;
       text-align: center;
@@ -384,7 +380,35 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       font-weight: 600;
     }
 
-    /* Event Timeline */
+    .preflight-box {
+      background: var(--bg-input);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 10px;
+      margin-bottom: 10px;
+    }
+    .preflight-item {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.75rem;
+      padding: 3px 0;
+      border-bottom: 1px solid var(--border-color);
+    }
+    .preflight-item:last-child { border-bottom: none; }
+    .pf-pass { color: var(--green); font-weight: bold; }
+    .pf-fail { color: var(--red); font-weight: bold; }
+
+    .trial-summary-box {
+      display: none;
+      background: #064e3b;
+      color: #ecfdf5;
+      border: 1px solid #10b981;
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-size: 0.78rem;
+      margin-top: 8px;
+    }
+
     .timeline-box {
       max-height: 180px;
       overflow-y: auto;
@@ -401,7 +425,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .t-fault { color: #c084fc; font-weight: bold; }
     .t-trial { color: #38bdf8; }
 
-    /* Modal */
     .modal-backdrop {
       display: none;
       position: fixed;
@@ -558,11 +581,41 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Right Column: Trial Recording & Guided Run -->
+    <!-- Right Column: Pre-Flight Check, Trial Protocol, Guided Run -->
     <div class="side-column">
+      <!-- Pre-Flight Verification Card -->
       <div class="card">
         <div class="card-title">
-          <span>Trial Recording Protocol</span>
+          <span>Hardware Pre-Flight Surveillance</span>
+          <button class="btn-secondary" style="padding:2px 8px;font-size:0.7rem" onclick="runPreflightCheck()">Run Pre-Flight</button>
+        </div>
+        <div class="preflight-box">
+          <div class="preflight-item">
+            <span>USB Serial Connected:</span>
+            <span id="pfConn" class="pf-fail">FAIL (No USB)</span>
+          </div>
+          <div class="preflight-item">
+            <span>Sample Rate (45–55 Hz):</span>
+            <span id="pfHz" class="pf-fail">FAIL (0.0 Hz)</span>
+          </div>
+          <div class="preflight-item">
+            <span>Calibration Complete:</span>
+            <span id="pfCal" class="pf-fail">FAIL (Pending)</span>
+          </div>
+          <div class="preflight-item">
+            <span>IMU Sensor Health (Q &ge; 0.50):</span>
+            <span id="pfFault" class="pf-fail">FAIL (Unhealthy)</span>
+          </div>
+        </div>
+        <div id="preflightStatusMsg" style="font-size:0.72rem;color:var(--red);font-weight:600">
+          🔒 Recording blocked. Run pre-flight check when hardware is ready.
+        </div>
+      </div>
+
+      <!-- Trial Protocol Card -->
+      <div class="card">
+        <div class="card-title">
+          <span>Trial Protocol Collector</span>
           <span class="chip" id="pilotChip">pilot1</span>
         </div>
 
@@ -575,15 +628,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <label>Participant ID</label>
         <input type="text" id="partId" value="P01" oninput="updateTrialIdPreview()">
 
-        <label>Activity</label>
+        <label>Activity Protocol</label>
         <select id="activitySelect" onchange="onActivityChange()">
+          <!-- Falls -->
           <option value="FALL_FORWARD" data-fall="true">FALL: Forward Fall (Mat)</option>
           <option value="FALL_BACKWARD" data-fall="true">FALL: Backward Fall (Mat)</option>
           <option value="FALL_LATERAL" data-fall="true">FALL: Lateral Fall (Mat)</option>
-          <option value="FALL_SYNCOPE" data-fall="true">FALL: Faint / Syncope (Slow)</option>
+          <option value="FALL_DIAG" data-fall="true">FALL: Diagonal Fall (Mat)</option>
+          <option value="FALL_WALK" data-fall="true">FALL: Fall While Walking (Dynamic)</option>
+          <option value="FALL_SYNCOPE" data-fall="true">FALL: Syncope / Faint (Optional - Slow Onset)</option>
+          <!-- ADLs -->
           <option value="WALKING" data-fall="false">ADL: Normal Walking</option>
+          <option value="RUN" data-fall="false">ADL: Running / Jogging</option>
+          <option value="STAIRS" data-fall="false">ADL: Stairs (Ascent / Descent)</option>
+          <option value="SIT_HARD" data-fall="false">ADL: Sit Down Abruptly (Hard Chair)</option>
+          <option value="SIT_TO_STAND" data-fall="false">ADL: Sit to Stand (Normal)</option>
+          <option value="LIE_DOWN" data-fall="false">ADL: Lying Down (Bed / Sofa)</option>
           <option value="JUMPING" data-fall="false">ADL: Vertical Jump</option>
-          <option value="SIT_TO_STAND" data-fall="false">ADL: Sit to Stand</option>
           <option value="STUMBLE" data-fall="false">ADL: Trip / Stumble Recovery</option>
           <option value="OTHER" data-fall="false">OTHER: Custom Activity...</option>
         </select>
@@ -597,9 +658,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div>
             <label>Placement</label>
             <select id="placementSelect">
-              <option value="waist">Waist (Belt)</option>
+              <option value="waist">Waist (Belt / Default)</option>
               <option value="chest">Chest</option>
               <option value="thigh">Thigh</option>
+              <option value="pocket">Pocket</option>
+              <option value="wrist">Wrist</option>
             </select>
           </div>
           <div>
@@ -608,6 +671,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               <option value="front">Front</option>
               <option value="side">Side</option>
               <option value="back">Back</option>
+              <option value="rotated 90">Rotated 90°</option>
             </select>
           </div>
         </div>
@@ -619,16 +683,25 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           Next Trial ID: <strong id="trialIdPreview" style="color:var(--accent)">P01_FALL_FWD_01</strong>
         </div>
 
-        <button class="btn-primary" id="btnRecord" style="width:100%;padding:10px" onclick="startTrialCountdown()">
-          ▶ Record Trial (3-2-1)
+        <button class="btn-primary" id="btnRecord" style="width:100%;padding:10px" onclick="startTrialCountdown()" disabled>
+          ▶ Record Trial (Pass Pre-Flight First)
         </button>
 
         <div id="onsetAlert" class="onset-indicator">
-          [SPACE] Onset Marker Recorded!
+          [SPACE] Fall Movement Onset Recorded (PC Clock)!
+        </div>
+
+        <!-- Post-Trial Outcome Summary Card -->
+        <div id="trialSummaryCard" class="trial-summary-box">
+          <div style="font-weight:bold;margin-bottom:4px" id="sumTitle">Trial Outcome:</div>
+          <div>Detected: <strong id="sumDetected">--</strong></div>
+          <div>Sensor Fault: <strong id="sumFault">--</strong></div>
+          <div>Latency: <strong id="sumLatency">--</strong></div>
+          <div>Samples Captured: <strong id="sumSamples">--</strong></div>
         </div>
 
         <div style="margin-top:10px;font-size:0.72rem;color:var(--text-muted)">
-          Tip: Press <kbd style="background:#334155;color:#fff;padding:1px 5px;border-radius:3px">SPACE</kbd> during fall trials to mark ground-truth movement onset.
+          Timing: Movement onset and device detection use the <strong>PC clock at line receipt</strong> (<kbd style="background:#334155;color:#fff;padding:1px 5px;border-radius:3px">SPACE</kbd> = onset).
         </div>
       </div>
 
@@ -646,25 +719,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div style="background:var(--bg-input);padding:8px;border-radius:4px;font-size:0.75rem;margin-bottom:8px">
             <div>Current Cue: <strong id="guidedNow" style="color:var(--accent)">--</strong></div>
             <div style="color:var(--text-muted)">Next: <span id="guidedNext">--</span></div>
-            <div style="margin-top:4px;font-size:0.85rem">Rest Timer: <strong id="guidedTimer">0s</strong></div>
           </div>
           <button class="btn-success" id="btnGuidedNext" style="width:100%" onclick="executeGuidedStep()">Next Guided Step</button>
-        </div>
-      </div>
-
-      <!-- Export Card -->
-      <div class="card">
-        <div class="card-title">
-          <span>Data Export &amp; Persistence</span>
-        </div>
-        <div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:8px">
-          Target Folder: <code id="exportFolderLabel" style="color:var(--accent)">data/pilot1/</code>
-        </div>
-        <button class="btn-secondary" style="width:100%;margin-bottom:6px" onclick="triggerDownloadZip()">
-          💾 Download Pilot CSVs
-        </button>
-        <div style="font-size:0.68rem;color:var(--text-muted)">
-          Autosave active: every trial is saved directly to data/ upon completion.
         </div>
       </div>
     </div>
@@ -725,12 +781,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const minSec = nowSec - chartWindowSeconds;
       const visible = dataBuffer.filter(d => d[0] >= minSec);
 
-      // Y-scale range (0 to 25 m/s² for accel, scaled jerk)
       const yMin = 0.0, yMax = 25.0;
       const toY = (v) => h - 20 - ((v - yMin) / (yMax - yMin)) * (h - 35);
       const toX = (t) => 35 + ((t - minSec) / chartWindowSeconds) * (w - 45);
 
-      // Grid & Y-Axis Labels
+      // Grid Lines
       ctx.strokeStyle = '#1e293b';
       ctx.lineWidth = 1;
       ctx.fillStyle = '#64748b';
@@ -744,7 +799,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         ctx.fillText(val.toString(), 10, y + 3);
       });
 
-      // Threshold Reference Lines
       // Free Fall: 5.0
       ctx.strokeStyle = '#f59e0b';
       ctx.setLineDash([4, 4]);
@@ -766,7 +820,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         return;
       }
 
-      // Draw Jerk / 10 Line (Orange)
+      // Jerk / 10 Line (Orange)
       ctx.strokeStyle = '#fb923c';
       ctx.lineWidth = 1.5;
       ctx.beginPath();
@@ -777,7 +831,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       });
       ctx.stroke();
 
-      // Draw Acceleration Magnitude Line (Cyan)
+      // Acceleration Magnitude Line (Cyan)
       ctx.strokeStyle = '#38bdf8';
       ctx.lineWidth = 1.8;
       ctx.beginPath();
@@ -805,7 +859,58 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // Telemetry Polling & UI State Synchronization
+    // Pre-Flight Surveillance Engine
+    // ──────────────────────────────────────────────────────────────────────────
+    let preflightPassed = false;
+    let cachedTelemetry = null;
+
+    function runPreflightCheck() {
+      if (!cachedTelemetry) {
+        alert('Cannot run pre-flight: no telemetry received from server.');
+        return;
+      }
+      const data = cachedTelemetry;
+      const connPass = data.connection === 'connected';
+      const hzPass = data.liveHz >= 42.0 && data.liveHz <= 58.0;
+      const calPass = !data.state.toLowerCase().includes('calibrat');
+      const faultPass = data.sensorState !== 'FAULT' && data.Q >= 0.50;
+
+      const pfConn = document.getElementById('pfConn');
+      pfConn.textContent = connPass ? 'PASS (Connected)' : 'FAIL (Disconnected)';
+      pfConn.className = connPass ? 'pf-pass' : 'pf-fail';
+
+      const pfHz = document.getElementById('pfHz');
+      pfHz.textContent = hzPass ? `PASS (${data.liveHz.toFixed(1)} Hz)` : `FAIL (${data.liveHz.toFixed(1)} Hz)`;
+      pfHz.className = hzPass ? 'pf-pass' : 'pf-fail';
+
+      const pfCal = document.getElementById('pfCal');
+      pfCal.textContent = calPass ? 'PASS (Normal)' : 'FAIL (Calibrating)';
+      pfCal.className = calPass ? 'pf-pass' : 'pf-fail';
+
+      const pfFault = document.getElementById('pfFault');
+      pfFault.textContent = faultPass ? `PASS (Q=${data.Q.toFixed(2)})` : `FAIL (Fault Q=${data.Q.toFixed(2)})`;
+      pfFault.className = faultPass ? 'pf-pass' : 'pf-fail';
+
+      const msg = document.getElementById('preflightStatusMsg');
+      const btn = document.getElementById('btnRecord');
+
+      if (connPass && hzPass && calPass && faultPass) {
+        preflightPassed = true;
+        btn.disabled = false;
+        btn.textContent = '▶ Record Trial (Ready)';
+        msg.textContent = '✅ Pre-flight passed! Recording unlocked.';
+        msg.style.color = 'var(--green)';
+      } else {
+        preflightPassed = false;
+        btn.disabled = true;
+        btn.textContent = '▶ Record Trial (Pass Pre-Flight First)';
+        msg.textContent = '❌ Pre-flight failed. Resolve hardware errors above.';
+        msg.style.color = 'var(--red)';
+      }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Telemetry Polling & Live State Sync
     // ──────────────────────────────────────────────────────────────────────────
     let lastEventCount = 0;
     let pendingAction = null;
@@ -815,8 +920,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const res = await fetch('/api/telemetry');
         if (!res.ok) throw new Error('API offline');
         const data = await res.json();
+        cachedTelemetry = data;
 
-        // Update Connection Chip
+        // Invalidate preflight if critical fault occurs during operation
+        if (preflightPassed && (data.connection !== 'connected' || data.sensorState === 'FAULT')) {
+          preflightPassed = false;
+          const btn = document.getElementById('btnRecord');
+          if (!trialRecordingActive) {
+            btn.disabled = true;
+            btn.textContent = '▶ Record Trial (Pre-Flight Invalidated)';
+          }
+          document.getElementById('preflightStatusMsg').textContent = '⚠️ Hardware condition changed. Re-run pre-flight check.';
+          document.getElementById('preflightStatusMsg').style.color = 'var(--amber)';
+        }
+
+        // Connection Chip
         const dot = document.getElementById('connDot');
         const txt = document.getElementById('connText');
         dot.className = 'dot dot-' + data.connection;
@@ -827,16 +945,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         document.getElementById('loopVal').textContent = data.stat.loopMean;
         document.getElementById('heapVal').textContent = data.stat.freeHeap;
 
-        // Replay Banner
         document.getElementById('replayBanner').style.display = data.isReplay ? 'block' : 'none';
 
-        // State Banners
         const isFall = data.state.includes('FALL') || data.state.includes('ALERT');
         const isFault = data.sensorState === 'FAULT';
         document.getElementById('fallAlarmBanner').style.display = isFall ? 'flex' : 'none';
         document.getElementById('sensorFaultBanner').style.display = isFault ? 'flex' : 'none';
 
-        // Top Metrics
         document.getElementById('stateVal').textContent = data.state;
         document.getElementById('magVal').textContent = data.mag.toFixed(2) + ' m/s²';
         document.getElementById('jerkVal').textContent = data.jerk.toFixed(1) + ' m/s³';
@@ -844,14 +959,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         document.getElementById('eVal').textContent = data.E.toFixed(2);
         document.getElementById('confVal').textContent = data.conf >= 0 ? (data.conf * 100).toFixed(1) + '%' : '--';
 
-        // Buffer Chart Data
         if (!isPaused) {
           const tRel = performance.now() / 1000.0;
           dataBuffer.push([tRel, data.mag, data.jerk]);
           if (dataBuffer.length > 2500) dataBuffer.shift();
         }
 
-        // Timeline
         if (data.events && data.events.length !== lastEventCount) {
           lastEventCount = data.events.length;
           const list = document.getElementById('timelineList');
@@ -883,10 +996,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       if (val === 'FALL_FORWARD') return 'FALL_FWD';
       if (val === 'FALL_BACKWARD') return 'FALL_BWD';
       if (val === 'FALL_LATERAL') return 'FALL_LAT';
+      if (val === 'FALL_DIAG') return 'FALL_DIAG';
+      if (val === 'FALL_WALK') return 'FALL_WALK';
       if (val === 'FALL_SYNCOPE') return 'FALL_SYNC';
       if (val === 'WALKING') return 'WALK';
-      if (val === 'JUMPING') return 'JUMP';
+      if (val === 'RUN') return 'RUN';
+      if (val === 'STAIRS') return 'STAIRS';
+      if (val === 'SIT_HARD') return 'SIT_HARD';
       if (val === 'SIT_TO_STAND') return 'SIT_STAND';
+      if (val === 'LIE_DOWN') return 'LIE_DOWN';
+      if (val === 'JUMPING') return 'JUMP';
       if (val === 'STUMBLE') return 'STUMBLE';
       return 'OTHER';
     }
@@ -905,7 +1024,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
 
     function startTrialCountdown() {
+      if (!preflightPassed) {
+        alert('Recording is blocked: Please run and pass Pre-Flight Surveillance first.');
+        return;
+      }
       if (trialRecordingActive) return;
+
       const box = document.getElementById('countdownBox');
       const digit = document.getElementById('countdownDigit');
       const sub = document.getElementById('countdownSub');
@@ -915,6 +1039,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       box.style.display = 'block';
       onsetMarked = false;
       document.getElementById('onsetAlert').style.display = 'none';
+      document.getElementById('trialSummaryCard').style.display = 'none';
 
       let count = 3;
       digit.textContent = count;
@@ -968,7 +1093,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       let remain = durSec;
 
       digit.textContent = remain + 's';
-      sub.textContent = 'Press SPACE to mark fall onset';
+      sub.textContent = 'Press SPACE to mark fall movement onset';
 
       const interval = setInterval(async () => {
         remain--;
@@ -984,13 +1109,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     async function finishTrial() {
       trialRecordingActive = false;
-      document.getElementById('btnRecord').disabled = false;
-      await fetch('/api/trial/end', { method: 'POST' });
+      const res = await fetch('/api/trial/end', { method: 'POST' });
+      const summary = await res.json();
+
+      // Display trial results on-screen
+      const sumCard = document.getElementById('trialSummaryCard');
+      sumCard.style.display = 'block';
+      document.getElementById('sumTitle').textContent = `Outcome for ${summary.trial_id}:`;
+      document.getElementById('sumDetected').textContent = summary.detected ? 'YES (Confirmed)' : 'NO (Unconfirmed)';
+      document.getElementById('sumDetected').style.color = summary.detected ? '#f87171' : '#4ade80';
+      document.getElementById('sumFault').textContent = summary.sensor_fault ? 'FAULT DETECTED' : 'NONE (Healthy)';
+      document.getElementById('sumFault').style.color = summary.sensor_fault ? '#c084fc' : '#4ade80';
+      document.getElementById('sumLatency').textContent = summary.latency_ms ? `${summary.latency_ms} ms (${summary.latency_ref})` : 'N/A';
+      document.getElementById('sumSamples').textContent = summary.samples;
+
+      // Re-enable record button if preflight still valid
+      document.getElementById('btnRecord').disabled = !preflightPassed;
       trialCounter++;
       updateTrialIdPreview();
     }
 
-    // Spacebar Onset Marker
+    // Spacebar Onset Marker (Strictly PC Wall Clock)
     window.addEventListener('keydown', (e) => {
       if (e.code === 'Space' && trialRecordingActive && !onsetMarked) {
         e.preventDefault();
@@ -1011,12 +1150,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     function planGuidedSession() {
       const mins = parseInt(document.getElementById('sessionLenMin').value, 10) || 15;
       const totalSec = mins * 60;
-      const trialBlockSec = 10 + 8; // 10s trial + 8s rest
+      const trialBlockSec = 10 + 8;
       const totalTrials = Math.max(4, Math.floor(totalSec / trialBlockSec));
 
-      // Build balanced plan: ~35% Falls, ~65% ADLs
-      const fallTypes = ['FALL_FORWARD', 'FALL_BACKWARD', 'FALL_LATERAL', 'FALL_SYNCOPE'];
-      const adlTypes = ['WALKING', 'JUMPING', 'SIT_TO_STAND', 'STUMBLE'];
+      const fallTypes = ['FALL_FORWARD', 'FALL_BACKWARD', 'FALL_LATERAL', 'FALL_DIAG', 'FALL_WALK'];
+      const adlTypes = ['WALKING', 'RUN', 'STAIRS', 'SIT_HARD', 'SIT_TO_STAND', 'LIE_DOWN', 'JUMPING', 'STUMBLE'];
 
       guidedQueue = [];
       for (let i = 0; i < totalTrials; i++) {
@@ -1051,7 +1189,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // Modal & Safety Confirmation Logic
+    // Confirmation Modals
     // ──────────────────────────────────────────────────────────────────────────
     function confirmCancel() {
       pendingAction = () => fetch('/api/device/cancel', { method: 'POST' });
@@ -1102,7 +1240,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     function switchPort(p) { fetch('/api/ports/switch?port=' + encodeURIComponent(p), { method: 'POST' }); }
     function reconnectPort() { fetch('/api/ports/reconnect', { method: 'POST' }); }
-    function triggerDownloadZip() { window.location.href = '/api/export'; }
     function clearEvents() { fetch('/api/events/clear', { method: 'POST' }); }
 
     function toggleTheme() {
@@ -1189,10 +1326,15 @@ def parse_telemetry_line(line: str):
         msg = ",".join(parts[2:]) if len(parts) > 2 else line
         timestamp_s = int(parts[1]) / 1000.0 if len(parts) > 1 and parts[1].isdigit() else time.time()
         event_str = f"{timestamp_s:.1f}s — {msg}"
+
         with state_lock:
             latest_state["events"].insert(0, event_str)
             if len(latest_state["events"]) > 50:
                 latest_state["events"].pop()
+
+            # Record sensor_fault if SENSOR_FAULT event arrives during trial
+            if active_trial is not None and "SENSOR_FAULT" in msg:
+                active_trial["sensor_fault"] = True
         return
 
     # Extended Telemetry Line:
@@ -1217,7 +1359,9 @@ def parse_telemetry_line(line: str):
                 e_val = float(parts[14]) if len(parts) > 14 else 0.0
                 sensor_st = parts[15].strip() if len(parts) > 15 else "OK"
 
-                # Check for active trial surveillance
+                # Arrival timestamp strictly from PC wall clock
+                now_wall_ms = int(now * 1000)
+
                 with state_lock:
                     latest_state.update({
                         "connection": "connected",
@@ -1239,19 +1383,24 @@ def parse_telemetry_line(line: str):
                         "sensorState": sensor_st,
                     })
 
-                    # If trial is recording, append to trial buffer and check detection
+                    # Trial Surveillance Rules:
+                    # 1. 'detected' set ONLY on FALL_CONFIRMED or ALERT_SENT
+                    # 2. 'sensor_fault' set ONLY on SENSOR_FAULT
+                    # 3. Detection timing strictly from PC clock (now_wall_ms)
                     if active_trial is not None:
                         active_trial["samples"] += 1
-                        if "FALL" in state_str or "ALERT" in state_str:
+
+                        if ("FALL_CONFIRMED" in state_str or "ALERT_SENT" in state_str or 
+                            state_str.startswith("FALL CONFIRMED") or state_str.startswith("ALERT SENT")):
                             active_trial["detected"] = True
                             if active_trial["detect_wall_ms"] is None:
-                                active_trial["detect_wall_ms"] = int(time.time() * 1000)
-                        if sensor_st == "FAULT" or q_val < 0.5:
+                                active_trial["detect_wall_ms"] = now_wall_ms  # PC Clock
+
+                        if sensor_st == "FAULT" or state_str == "SENSOR_FAULT":
                             active_trial["sensor_fault"] = True
 
-                        wall_ms = int(time.time() * 1000)
                         active_trial["samples_data"].append([
-                            active_trial["trial_id"], wall_ms, ms, mag, jerk, state_str, conf, act, q_val, e_val
+                            active_trial["trial_id"], now_wall_ms, ms, mag, jerk, state_str, conf, act, q_val, e_val
                         ])
             except Exception:
                 pass
@@ -1302,7 +1451,6 @@ def serial_supervision_thread():
                     if line:
                         parse_telemetry_line(line)
                     else:
-                        # Check for no-data timeout (>2.0s)
                         if time.time() - last_telemetry_time > 2.0:
                             connection_status = "no_data"
                 except (serial.SerialException, OSError):
@@ -1335,7 +1483,6 @@ def replay_worker_thread(csv_path: Path):
                 for line in f:
                     if stop_threads:
                         break
-                    # Format as TELEMETRY line
                     parts = line.strip().split(",")
                     if len(parts) >= 6:
                         ms = parts[0]
@@ -1373,7 +1520,6 @@ class OfflineDashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             with state_lock:
-                # Update connection state snapshot
                 latest_state["connection"] = connection_status
                 latest_state["isReplay"] = is_replay_mode
                 copy_state = dict(latest_state)
@@ -1388,20 +1534,6 @@ class OfflineDashboardHandler(BaseHTTPRequestHandler):
                 for p in serial.tools.list_ports.comports()
             ]
             self.wfile.write(json.dumps(ports_list).encode("utf-8"))
-
-        elif path == "/api/export":
-            # Package and download current pilot session CSVs
-            global pilot_dir
-            if not pilot_dir:
-                pilot_dir = get_or_create_pilot_dir()
-
-            trials_file = pilot_dir / "trials.csv"
-            content = trials_file.read_text(encoding="utf-8") if trials_file.exists() else "No trials recorded yet."
-            self.send_response(200)
-            self.send_header("Content-Type", "text/csv; charset=utf-8")
-            self.send_header("Content-Disposition", f'attachment; filename="{pilot_dir.name}_trials.csv"')
-            self.end_headers()
-            self.wfile.write(content.encode("utf-8"))
 
         else:
             self.send_response(404)
@@ -1472,7 +1604,7 @@ class OfflineDashboardHandler(BaseHTTPRequestHandler):
             dur = float(data.get("duration_s", 10.0))
 
             send_serial_cmd(f"TRIAL,{tid}\n")
-            cue_ms = int(time.time() * 1000)
+            cue_ms = int(time.time() * 1000)  # PC Clock
 
             with state_lock:
                 active_trial = {
@@ -1500,13 +1632,13 @@ class OfflineDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/trial/mark_onset":
             with state_lock:
                 if active_trial is not None and active_trial["onset_wall_ms"] is None:
+                    # Explicitly using PC system clock for movement onset
                     active_trial["onset_wall_ms"] = int(time.time() * 1000)
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"OK")
 
         elif path == "/api/trial/end":
-            # Send ACK to clear any alert without training classifier
             send_serial_cmd("ACK\n")
             send_serial_cmd("TRIAL,\n")
 
@@ -1514,8 +1646,15 @@ class OfflineDashboardHandler(BaseHTTPRequestHandler):
                 if active_trial is not None:
                     tr = active_trial
                     active_trial = None
+                else:
+                    tr = None
 
-            # Calculate Latency strictly with onset_marker
+            if not tr:
+                self.send_response(400)
+                self.end_headers()
+                return
+
+            # Latency strictly computed via PC wall clock difference
             latency_ms = ""
             latency_ref = "none"
             if tr["detected"] and tr["onset_wall_ms"] and tr["detect_wall_ms"]:
@@ -1524,7 +1663,19 @@ class OfflineDashboardHandler(BaseHTTPRequestHandler):
                     latency_ms = str(diff)
                     latency_ref = "onset_marker"
 
-            # Autosave directly to data/pilotN/ (unless in replay mode)
+            summary = {
+                "trial_id": tr["trial_id"],
+                "detected": tr["detected"],
+                "sensor_fault": tr["sensor_fault"],
+                "latency_ms": latency_ms,
+                "latency_ref": latency_ref,
+                "samples": tr["samples"],
+            }
+
+            with state_lock:
+                latest_state["lastTrialSummary"] = summary
+
+            # Autosave directly to data/pilotN/ (suppressed in replay mode)
             if not is_replay_mode:
                 if not pilot_dir:
                     pilot_dir = get_or_create_pilot_dir()
@@ -1551,15 +1702,15 @@ class OfflineDashboardHandler(BaseHTTPRequestHandler):
                 print(f"[AUTOSAVE] Saved {tr['trial_id']} ({tr['samples']} samples) to {pilot_dir.name}/")
 
             self.send_response(200)
+            self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b"OK")
+            self.wfile.write(json.dumps(summary).encode("utf-8"))
 
         else:
             self.send_response(404)
             self.end_headers()
 
     def log_message(self, format, *args):
-        # Suppress routine request logs
         pass
 
 
@@ -1581,7 +1732,7 @@ def main():
     verify_offline_compliance(DASHBOARD_HTML)
 
     active_port_name = args.port
-    pilot_dir = get_or_create_pilot_dir(args.pilot)
+    # Note: pilot_dir is kept None until an actual trial is saved, keeping data/ clean
 
     # Step 2: Serial / Replay Thread Launch
     if args.replay:
@@ -1610,7 +1761,6 @@ def main():
     print(f"  URL              : {url}")
     print(f"  Bind Address     : {DEFAULT_HOST} (Localhost Only)")
     print(f"  Serial Port      : {active_port_name}")
-    print(f"  Persistence Dir  : {pilot_dir.resolve()}")
     if args.replay:
         print(f"  Mode             : REPLAY / NOT LIVE ({Path(args.replay).name})")
     else:
