@@ -45,6 +45,10 @@ latest_state = {
     "theta": 0.65,
     "impThresh": 22.0,
     "jerkThresh": 500.0,
+    "sensorState": "OK",
+    "Q": 1.0,
+    "E": 1.0,
+    "trialId": "NONE",
     "events": []
 }
 
@@ -76,6 +80,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .s-danger { color: #f87171; animation: pulse 1s infinite alternate; }
     .s-cal { color: #60a5fa; }
     @keyframes pulse { from { opacity: 0.7; } to { opacity: 1; transform: scale(1.02); } }
+    .badge-ok { background: #16a34a; color: #fff; font-size: 0.85rem; padding: 3px 10px; border-radius: 6px; font-weight: 700; display: inline-block; }
+    .badge-fault { background: #dc2626; color: #fff; font-size: 0.85rem; padding: 3px 10px; border-radius: 6px; font-weight: 700; display: inline-block; animation: pulse 1s infinite alternate; }
     .chart-card { background: #1e293b; border-radius: 10px; padding: 16px; margin-bottom: 14px; border: 1px solid #334155; }
     canvas { width: 100%!important; height: 210px!important; }
     .log-card { background: #1e293b; border-radius: 10px; padding: 16px; margin-bottom: 14px; border: 1px solid #334155; max-height: 220px; overflow-y: auto; }
@@ -113,6 +119,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="value" id="theta">--</div></div>
   <div class="card"><div class="label">Impact / Jerk Thresholds</div>
     <div class="value" id="thresholds" style="font-size:1.05rem">--</div></div>
+  <div class="card"><div class="label">Sensor State</div>
+    <div class="status" id="sensorState"><span class="badge-ok">OK</span></div></div>
+  <div class="card"><div class="label">Quality Index (Q)</div>
+    <div class="value" id="qVal">1.00</div>
+    <meter id="qGauge" min="0" max="1" low="0.5" high="0.9" optimum="1.0" value="1.0" style="width:100%;height:8px;margin-top:6px"></meter>
+  </div>
+  <div class="card"><div class="label">Windowed Energy (E)</div>
+    <div class="value" id="eVal">1.00</div></div>
+  <div class="card"><div class="label">Active Trial</div>
+    <div class="value" id="trialId" style="font-size:1.3rem">NONE</div></div>
 </div>
 
 <div class="chart-card">
@@ -135,6 +151,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div style="display:flex;align-items:center;margin-top:8px">
     <input type="range" id="thetaSlider" min="50" max="85" value="65" oninput="setTheta(this.value/100)">
     <span class="theta-val" id="sliderVal">0.65</span>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:14px">
+  <div class="label">Trial Protocol Management</div>
+  <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
+    <input type="text" id="trialInput" placeholder="Enter Trial ID (e.g. T01_FALL)" style="background:#0f172a;border:1px solid #334155;color:#f8fafc;padding:8px 12px;border-radius:6px;flex:1">
+    <button class="btn-ack" style="flex:0 0 130px;padding:8px 14px" onclick="setTrial()">Set Trial</button>
+    <button class="btn-cancel" style="flex:0 0 130px;padding:8px 14px" onclick="clearTrial()">Clear Trial</button>
   </div>
 </div>
 
@@ -209,6 +234,27 @@ const refresh = async () => {
     document.getElementById('activity').textContent = d.activity;
     document.getElementById('counts').textContent   = d.fallCount + ' / ' + d.nonFallCount;
     document.getElementById('theta').textContent    = d.theta.toFixed(2);
+    const sEl = document.getElementById('sensorState');
+    if (sEl) {
+      if (d.sensorState === 'FAULT') {
+        sEl.innerHTML = '<span class="badge-fault">FAULT</span>';
+      } else {
+        sEl.innerHTML = '<span class="badge-ok">OK</span>';
+      }
+    }
+    if (document.getElementById('qVal')) {
+      document.getElementById('qVal').textContent = (d.Q !== undefined ? d.Q.toFixed(2) : '1.00');
+    }
+    if (document.getElementById('qGauge')) {
+      document.getElementById('qGauge').value = (d.Q !== undefined ? d.Q : 1.0);
+    }
+    if (document.getElementById('eVal')) {
+      document.getElementById('eVal').textContent = (d.E !== undefined ? d.E.toFixed(2) : '1.00');
+    }
+    if (document.getElementById('trialId')) {
+      document.getElementById('trialId').textContent = d.trialId || 'NONE';
+    }
+
     document.getElementById('thresholds').textContent =
       'Impact: ' + d.impThresh.toFixed(1) + ' | Jerk: ' + d.jerkThresh.toFixed(0);
 
@@ -227,6 +273,14 @@ const refresh = async () => {
   }
 };
 
+const setTrial = async () => {
+  const tid = document.getElementById('trialInput').value.trim();
+  if (tid) await fetch('/setTrial?id=' + encodeURIComponent(tid));
+};
+const clearTrial = async () => {
+  document.getElementById('trialInput').value = '';
+  await fetch('/setTrial?id=');
+};
 const cancelAlert = async () => { await fetch('/cancel'); };
 const ackAlert    = async () => { await fetch('/ack'); };
 const setTheta    = async (v) => {
@@ -265,6 +319,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             with state_lock:
                 data_copy = dict(latest_state)
             self.wfile.write(json.dumps(data_copy).encode('utf-8'))
+
+        elif path == "/setTrial":
+            tid = params.get('id', [''])[0].strip()
+            if tid:
+                send_serial_cmd(f"TRIAL,{tid}\n")
+            else:
+                send_serial_cmd("TRIAL,\n")
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
 
         elif path == "/cancel":
             send_serial_cmd("CANCEL\n")
@@ -347,8 +411,8 @@ def parse_line(line):
                 latest_state["events"].pop()
         return
 
-    # Handle TELEMETRY lines (New extended format)
-    # TELEMETRY,<ms>,<mag>,<jerk>,<stateStr>,<conf>,<activity>,<fallCount>,<nonFallCount>,<theta>,<impThresh>,<jerkThresh>
+    # Handle TELEMETRY lines (Extended format with trial_id, Q, E, sensor_state)
+    # TELEMETRY,<ms>,<mag>,<jerk>,<stateStr>,<conf>,<activity>,<fallCount>,<nonFallCount>,<theta>,<impThresh>,<jerkThresh>,<trial_id>,<Q>,<E>,<sensor_state>
     if line.startswith("TELEMETRY,"):
         parts = line.split(",")
         if len(parts) >= 11:
@@ -364,6 +428,10 @@ def parse_line(line):
                 th = float(parts[9])
                 imp = float(parts[10])
                 jk = float(parts[11]) if len(parts) > 11 else 500.0
+                trial_id = parts[12].strip() if len(parts) > 12 else "NONE"
+                q_val = float(parts[13]) if len(parts) > 13 else 1.0
+                e_val = float(parts[14]) if len(parts) > 14 else 1.0
+                sensor_st = parts[15].strip() if len(parts) > 15 else "OK"
 
                 with state_lock:
                     latest_state.update({
@@ -376,9 +444,13 @@ def parse_line(line):
                         "nonFallCount": nfc,
                         "theta": th,
                         "impThresh": imp,
-                        "jerkThresh": jk
+                        "jerkThresh": jk,
+                        "trialId": trial_id,
+                        "Q": q_val,
+                        "E": e_val,
+                        "sensorState": sensor_st,
                     })
-                    telemetry_history.append([ms, mag, jerk, state_str, conf, act, fc, nfc, th, imp, jk])
+                    telemetry_history.append([ms, mag, jerk, state_str, conf, act, fc, nfc, th, imp, jk, trial_id, q_val, e_val, sensor_st])
                     if len(telemetry_history) > 300000:
                         telemetry_history.pop(0)
             except Exception:

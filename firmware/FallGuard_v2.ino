@@ -71,6 +71,7 @@ const float         THETA_MAX           = 0.85f;
 const float         THETA_MIN           = 0.50f;
 const float         THETA_UP            = 0.02f;
 const float         THETA_DOWN          = 0.01f;
+const float         E0                  = 1.0f;
 
 // --- Calibration Timing & Button ---
 const unsigned long CAL_DURATION_MS     = 20000;  // 20 s
@@ -99,6 +100,15 @@ enum FallState {
   ALERT_SENT
 };
 FallState state = CALIBRATING;
+
+// --- Part E: Telemetry & Performance Tracking ---
+float E_k = 1.0f;
+String currentTrialId = "";
+unsigned long lastStatPrintMs = 0;
+unsigned long statLoopCount = 0;
+unsigned long statSampleCount = 0;
+unsigned long statLoopUsSum = 0;
+unsigned long statLoopUsMax = 0;
 
 // --- Sensor Integrity State (USE_INTEGRITY) ---
 #if USE_INTEGRITY
@@ -517,6 +527,15 @@ void processSerialCommand(String cmd) {
     float v = cmd.substring(10).toFloat();
     theta = constrain(v, THETA_MIN, THETA_MAX);
     logEvent("THETA_SET_SERIAL=" + String(theta, 2));
+  } else if (cmd.startsWith("TRIAL,")) {
+    currentTrialId = cmd.substring(6);
+    currentTrialId.trim();
+    logEvent("TRIAL_SET=" + currentTrialId);
+    Serial.println("EVENT," + String(millis()) + ",TRIAL_SET," + currentTrialId);
+  } else if (cmd == "TRIAL" || cmd == "TRIAL,") {
+    currentTrialId = "";
+    logEvent("TRIAL_CLEARED");
+    Serial.println("EVENT," + String(millis()) + ",TRIAL_CLEARED");
   }
 #if USE_GNB
   else if (cmd == "TRAIN,FALL") {
@@ -557,6 +576,15 @@ void runFallDetection(unsigned long dt_us) {
   float jerk = liveJerk;
   pushWindow(liveMag, jerk);
 
+  // Windowed energy update: E_k = (1 - 0.02)*E_{k-1} + 0.02*(a_smooth - 9.81)^2 on valid samples
+#if USE_INTEGRITY
+  if (current_vk > 0.5f) {
+    E_k = 0.98f * E_k + 0.02f * (liveMag - 9.81f) * (liveMag - 9.81f);
+  }
+#else
+  E_k = 0.98f * E_k + 0.02f * (liveMag - 9.81f) * (liveMag - 9.81f);
+#endif
+
   if (state == NORMAL || state == CALIBRATING) {
     updateActivityBaseline(liveMag);
   }
@@ -596,7 +624,19 @@ void runFallDetection(unsigned long dt_us) {
   Serial.print(0.65f, 3); Serial.print(",");
 #endif
   Serial.print(IMPACT_THRESHOLD, 1); Serial.print(",");
-  Serial.println(JERK_THRESHOLD, 1);
+  Serial.print(JERK_THRESHOLD, 1);   Serial.print(",");
+  Serial.print(currentTrialId.length() > 0 ? currentTrialId : "NONE"); Serial.print(",");
+#if USE_INTEGRITY
+  Serial.print(Q, 2); Serial.print(",");
+#else
+  Serial.print(1.00f, 2); Serial.print(",");
+#endif
+  Serial.print(E_k, 2); Serial.print(",");
+#if USE_INTEGRITY
+  Serial.println(sensorFault ? "FAULT" : "OK");
+#else
+  Serial.println("OK");
+#endif
 
   bool isStill = (liveMag >= STILL_LOW && liveMag <= STILL_HIGH);
 
@@ -1042,6 +1082,15 @@ void handleData() {
   json += "\"activity\":\"" + activityName() + "\",";
   json += "\"impThresh\":"   + String(IMPACT_THRESHOLD, 1) + ",";
   json += "\"jerkThresh\":"  + String(JERK_THRESHOLD,   1) + ",";
+  json += "\"trialId\":\""   + (currentTrialId.length() > 0 ? currentTrialId : "NONE") + "\",";
+#if USE_INTEGRITY
+  json += "\"Q\":"           + String(Q, 2) + ",";
+  json += "\"sensorState\":\"" + String(sensorFault ? "FAULT" : "OK") + "\",";
+#else
+  json += "\"Q\":1.00,";
+  json += "\"sensorState\":\"OK\",";
+#endif
+  json += "\"E\":"           + String(E_k, 2) + ",";
   json += "\"log\":"         + evJSON;
   json += "}";
   server.send(200, "application/json", json);
@@ -1153,12 +1202,15 @@ void setup() {
 // ============================================================================
 
 void loop() {
+  unsigned long loopStartUs = micros();
+
   checkSerialCommands();
 
   unsigned long now_us = micros();
   if (now_us - lastSampleUs >= (unsigned long)SAMPLE_INTERVAL_MS * 1000UL) {
     unsigned long dt_us = (lastSampleUs == 0) ? (SAMPLE_INTERVAL_MS * 1000UL) : (now_us - lastSampleUs);
     lastSampleUs = now_us;
+    statSampleCount++;
     runFallDetection(dt_us);
   }
 
@@ -1180,4 +1232,34 @@ void loop() {
 #if USE_WIFI
   server.handleClient();
 #endif
+
+  // --- Performance Statistics Reporting (every 5 seconds) ---
+  unsigned long loopDurationUs = micros() - loopStartUs;
+  statLoopCount++;
+  statLoopUsSum += loopDurationUs;
+  if (loopDurationUs > statLoopUsMax) {
+    statLoopUsMax = loopDurationUs;
+  }
+
+  if (millis() - lastStatPrintMs >= 5000) {
+    float loop_us_mean = statLoopCount > 0 ? (float)statLoopUsSum / statLoopCount : 0.0f;
+    unsigned long loop_us_max = statLoopUsMax;
+    float dt_s = (millis() - lastStatPrintMs) / 1000.0f;
+    float actual_hz = dt_s > 0 ? (float)statSampleCount / dt_s : 0.0f;
+    uint32_t free_heap = ESP.getFreeHeap();
+    uint32_t min_free_heap = ESP.getMinFreeHeap();
+
+    Serial.print("# STAT,");
+    Serial.print(loop_us_mean, 1); Serial.print(",");
+    Serial.print(loop_us_max);      Serial.print(",");
+    Serial.print(actual_hz, 1);     Serial.print(",");
+    Serial.print(free_heap);        Serial.print(",");
+    Serial.println(min_free_heap);
+
+    lastStatPrintMs = millis();
+    statLoopCount = 0;
+    statSampleCount = 0;
+    statLoopUsSum = 0;
+    statLoopUsMax = 0;
+  }
 }
