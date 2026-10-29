@@ -1,273 +1,118 @@
-# FallGuard v2
+# FallGuard v2 — Embedded Wearable Fall Detection System
 
-`[ESP32]` `[MPU6050]` `[Fall Detection]` `[Embedded ML]` `[Python Logger]` `[MIT License]`
-
----
-
-## Overview
-
-**FallGuard v2** is a paper-grade wearable fall detection system built on the **ESP32 microcontroller** and the **MPU6050** 6-axis IMU. It implements a complete on-device signal processing and classification pipeline — no cloud, no external DSP chip — making it suitable for low-power, real-time elderly care and occupational safety applications.
-
-The system fuses a **3-phase rule engine** (pre-impact free-fall detection → impact detection → post-impact posture check) with an **Online Gaussian Naïve Bayes classifier** trained incrementally using **Welford's Algorithm** to distinguish genuine falls from everyday high-acceleration activities such as jumping, sitting down abruptly, or stumbling. An adaptive confidence threshold continuously re-calibrates itself to the wearer's baseline activity level.
+`[ESP32]` `[MPU6050]` `[Embedded C++]` `[Adaptive Kinematics]` `[Sensor Integrity]` `[Online ML]` `[MIT License]`
 
 ---
 
-## Key Features
+## 1. Overview
 
-- **3-Phase Rule Engine** — sequential free-fall → impact → rest validation minimises false positives
-- **Welford's Online Gaussian NB** — fully incremental classifier, no off-device training, O(1) memory per class
-- **Jerk-based discrimination** — rate-of-change of acceleration rejects impulsive non-fall events (jumps, stumbles)
-- **Activity-aware baseline** — the system infers SITTING / WALKING / RUNNING from rolling statistics and adjusts detection thresholds accordingly
-- **Live serial dashboard** — real-time telemetry printed at 50 Hz to the Arduino Serial Monitor
-- **Python logger** (`tools/logger.py`) — PC-side data recorder with live console metrics table and matplotlib session plots
-- **Alarm cancel button** — physical push-button lets the user suppress false alarms within a 10-second window
-- **Passive buzzer alert** — audible alarm on confirmed fall event
+**FallGuard v2** is an embedded fall-detection system running on the **ESP32 microcontroller** paired with an **InvenSense MPU6050** 6-axis IMU. The firmware performs real-time deterministic fall classification at **50 Hz** using on-chip processing, without cloud reliance or external DSP chips.
 
----
-
-## Hardware Required
-
-| Component | Notes |
-|-----------|-------|
-| ESP32 Dev Board | Any 38-pin variant (e.g. DOIT ESP32 DEVKIT V1) |
-| MPU6050 IMU | GY-521 breakout module |
-| Passive buzzer | 5 V passive buzzer |
-| Tactile push button | Momentary SPST, connected with internal pull-up |
-| Micro USB cable | For flashing and serial telemetry |
-| Breadboard + jumpers | Standard 400-point breadboard |
+The system features:
+1. **Multi-Criterion Sensor Integrity (`USE_INTEGRITY`):** Continuous I2C, range, freeze, and delta monitoring to prevent false triggers during sensor detachment or bus faults.
+2. **Dual-Path Kinematic Gating:**
+   - **Path 1 (Classical Free-Fall):** Free-fall dip ($a < 5.0\text{ m/s}^2$, $\ge 40\text{ ms}$) followed by impact ($a \ge 22.0\text{ m/s}^2$, $J \ge 500\text{ m/s}^3$).
+   - **Path 2 (`USE_PATH2` Direct High-Jerk):** Slip and trip detection ($J \ge 280\text{ m/s}^3$, $a \ge 11.5\text{ m/s}^2$) for low-clearance falls without free-fall.
+3. **Adaptive Thresholds (`USE_ADAPTIVE`):** Motion energy $E_k$ scales stillness verification interval $T_s \in [1500, 3000]\text{ ms}$; impact severity scales cancellation window $T_c \in [3000, 8000]\text{ ms}$.
+4. **Lifelong Online Learning (`USE_GNB`):** Welford Gaussian Naive Bayes classifier with cold-start lockout prevention (`classifierTrained` gating).
 
 ---
 
-## Wiring Table
+## 2. Hardware Connections & Pinout
 
-| Component | Signal | ESP32 Pin |
-|-----------|--------|-----------|
-| MPU6050 | VCC | 3.3 V |
-| MPU6050 | GND | GND |
-| MPU6050 | SDA | GPIO 21 |
-| MPU6050 | SCL | GPIO 22 |
-| Passive buzzer | + (positive) | GPIO 5 |
-| Passive buzzer | − (negative) | GND |
-| Push button | One leg | GPIO 2 |
-| Push button | Other leg | GND |
-
-> **Note:** GPIO 2 is configured as `INPUT_PULLUP` in firmware. No external resistor is required for the button.
+| ESP32 Pin | Peripheral Pin | Function | Notes |
+| :--- | :--- | :--- | :--- |
+| **3V3** | MPU6050 `VCC` | Power Supply | 3.3V regulated power rail |
+| **GND** | MPU6050 `GND` | Ground | Common system ground |
+| **GPIO 21** | MPU6050 `SDA` | I2C Data | 400 kHz Fast-Mode I2C |
+| **GPIO 22** | MPU6050 `SCL` | I2C Clock | 400 kHz Fast-Mode I2C |
+| **GPIO 2** | Pushbutton Pin A | Cancel / Calibrate Input | `INPUT_PULLUP` (Active LOW to GND) |
+| **GND** | Pushbutton Pin B | Button Return | Direct to ground |
+| **GPIO 5** | Buzzer (+) | Acoustic Alarm Output | Active PWM / Digital Out |
+| **GND** | Buzzer (-) | Buzzer Ground | Direct to ground |
 
 ---
 
-## Setup
+## 3. Getting Started
 
-1. **Install Arduino IDE** — download from [arduino.cc](https://www.arduino.cc/en/software) (version 2.x recommended).
-
-2. **Add the ESP32 board package**
-   - Open *File → Preferences*
-   - Add the following URL to *Additional Boards Manager URLs*:
-     ```
-     https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-     ```
-   - Open *Tools → Board → Boards Manager*, search for **esp32**, and install.
-
-3. **Wire libraries** — the `Wire` library (I²C for MPU6050) is **built in** to the ESP32 Arduino core. No separate installation is needed.
-
-4. **Flash the firmware**
-   - Open `firmware/FallGuard_v2.ino` in Arduino IDE.
-   - Select your board under *Tools → Board → ESP32 Arduino → ESP32 Dev Module*.
-   - Select the correct COM port under *Tools → Port*.
-   - Click **Upload** (Ctrl+U).
-
-5. **Open Serial Monitor** at **115200 baud** to view live telemetry immediately after boot.
-
----
-
-## Usage
-
-### Calibration Phase (first ~5 seconds after boot)
-
-On power-up the device enters **CALIBRATION** mode. Place the device on a flat surface or hold it still. The ESP32 computes the initial rolling mean and variance of the acceleration magnitude using Welford's algorithm. The Serial Monitor prints:
-
-```
-# FallGuard v2 booting...
-# Calibrating... keep device still
-# Calibration done. theta=0.72 baseline_mag=1.003
-```
-
-### Detection Phases
-
-| Phase | Trigger | Duration | Description |
-|-------|---------|----------|-------------|
-| `NORMAL` | — | continuous | Samples IMU at 50 Hz, updates rolling stats, prints CSV telemetry |
-| `PRE_IMPACT` | `mag < FREE_FALL_THRESH` for ≥ 3 consecutive samples | up to 500 ms | Possible free-fall detected; jerk discriminator active |
-| `IMPACT` | `mag > IMPACT_THRESH` while in PRE_IMPACT | — | Impact pulse detected; classifier runs feature extraction over 40-sample window |
-| `POST_IMPACT` | Classifier confidence ≥ θ | 10 s alarm window | Buzzer sounds; waits for user button press to cancel |
-
-### Button Behaviour
-
-- **Press within 10 s** of alarm → alarm cancelled (`ALARM_CANCELLED` logged), system returns to NORMAL.
-- **No press within 10 s** → alarm persists; a `FALL_CONFIRMED` event is logged (reserved for future caregiver alert integration).
-
----
-
-## Dashboard
-
-Open the **Arduino IDE Serial Monitor** (or any serial terminal at 115200 baud) to see the live CSV stream:
-
-```
-timestamp_ms,mag,jerk,phase,classifier_conf,activity,event_label
-12340,1.002,0.012,NORMAL,0.00,WALKING,
-12360,0.998,0.009,NORMAL,0.00,WALKING,
-...
-13500,0.211,4.320,PRE_IMPACT,0.00,WALKING,
-13520,3.841,18.23,IMPACT,0.91,WALKING,FALL_DETECTED
-```
-
-| Column | Description |
-|--------|-------------|
-| `timestamp_ms` | Milliseconds since boot |
-| `mag` | Resultant acceleration magnitude (g) |
-| `jerk` | Rate of change of magnitude (g/s) |
-| `phase` | Current state-machine phase |
-| `classifier_conf` | GNB posterior probability for FALL class |
-| `activity` | Inferred activity (SITTING/WALKING/RUNNING) |
-| `event_label` | `FALL_DETECTED` or `ALARM_CANCELLED` (empty on normal rows) |
-
----
-
-## Python Logger
-
-### Install dependencies
-
+### 3.1 Network Credentials Setup (`secrets.h`)
+Copy `firmware/secrets.example.h` to `firmware/secrets.h` and configure your local Wi-Fi credentials:
 ```bash
-pip install pyserial matplotlib numpy
+cp firmware/secrets.example.h firmware/secrets.h
+```
+Edit `firmware/secrets.h`:
+```c
+#ifndef SECRETS_H
+#define SECRETS_H
+
+const char* const WIFI_SSID     = "Your_WiFi_SSID";
+const char* const WIFI_PASSWORD = "Your_WiFi_Password";
+
+#endif
 ```
 
-### Run the logger
+### 3.2 Flashing Firmware
+1. Open `firmware/FallGuard_v2.ino` in the Arduino IDE or VS Code with ESP32 board support.
+2. Select target board: **ESP32 Dev Module**.
+3. Compile and flash over USB Serial (115200 baud).
 
+---
+
+## 4. System Timing & Kinematic Parameters
+
+| Parameter | Value | Units | Description |
+| :--- | :---: | :---: | :--- |
+| **Sampling Rate** | `50` | $\text{Hz}$ | Sensor sample interval ($20\text{ ms}$) |
+| **Calibration Duration** | `20000` | $\text{ms}$ | Initial rest calibration phase ($20\text{ s}$) |
+| **Free-Fall Threshold** | `5.0` | $\text{m/s}^2$ | Maximum acceleration during free-fall |
+| **Free-Fall Min Duration** | `40` | $\text{ms}$ | Minimum consecutive zero-g duration |
+| **Impact Search Window** | `1400` | $\text{ms}$ | Post-free-fall impact acceptance interval |
+| **Impact Acceleration Thresh** | `22.0` | $\text{m/s}^2$ | Peak resultant acceleration threshold |
+| **Impact Jerk Thresh** | `500.0` | $\text{m/s}^3$ | Peak jerk rate threshold |
+| **Path 2 Jerk Thresh** | `280.0` | $\text{m/s}^3$ | Direct high-jerk trigger threshold |
+| **Path 2 Accel Thresh** | `11.5` | $\text{m/s}^2$ | Direct high-jerk minimum acceleration |
+| **Stillness Window ($T_s$)** | `1500 - 3000` | $\text{ms}$ | Quiescent rest period ($2200\text{ ms}$ fixed default) |
+| **Alarm Cancel Window ($T_c$)** | `3000 - 8000` | $\text{ms}$ | User cancellation period ($5000\text{ ms}$ fixed default) |
+
+---
+
+## 5. Software Tools & Verification
+
+### 5.1 Verification Tests
+Execute the standalone unit test suite and state machine simulator:
+```bash
+python test_fallguard.py
+```
+Execute the hardware connection stubs:
+```bash
+python test_hardware_stubs.py
+```
+
+### 5.2 USB Serial Logger & Trial Protocol Tool
+Capture real-time telemetry, record per-trial CSV datasets, and add clinical ground-truth annotations:
 ```bash
 python tools/logger.py --port COM3 --baud 115200
 ```
+Interactive commands:
+- `t <id>`: Start recording a labeled trial (e.g. `t T01_FALL`).
+- `l`: Open interactive metadata prompt writing to `results/annotations.csv`.
+- `f` / `n`: Mark last event as Fall / Non-Fall.
 
-The logger saves a timestamped CSV to `results/session_YYYYMMDD_HHMMSS.csv` and displays a refreshing console dashboard every 2 seconds.
-
-During a session:
-- Type **`f` + Enter** → mark the most recent event as a **true fall** (TP/FN update)
-- Type **`n` + Enter** → mark the most recent event as a **non-fall** (FP/TN update)
-- **Ctrl+C** → stop logging, print final metrics, flush CSV
-
-### Generate plots from a saved session
-
-```python
-from tools.logger import plot_session
-plot_session("results/session_20240101_120000.csv")
+### 5.3 Local USB Web Dashboard
+Launch the zero-dependency local browser dashboard for real-time visualization:
+```bash
+python tools/local_dashboard.py COM3
 ```
+Dashboard is hosted at `http://localhost:5000`.
 
-Three figures are generated:
-
-| Plot | Description |
-|------|-------------|
-| Magnitude + Jerk | Dual Y-axis time series; event markers in red/green |
-| Classifier confidence | Confidence over time with event markers |
-| Event bar chart | Raw count of FALL_DETECTED vs ALARM_CANCELLED events |
-
----
-
-## Algorithm Overview
-
-### Welford's Online Gaussian Naïve Bayes
-
-Rather than pre-computing class statistics from a fixed training set, FallGuard v2 updates the mean $\mu$ and variance $\sigma^2$ of each feature per class **incrementally** using Welford's one-pass algorithm:
-
-$$
-\delta = x - \mu_n, \quad \mu_{n+1} = \mu_n + \frac{\delta}{n+1}, \quad M_{n+1} = M_n + \delta \cdot (x - \mu_{n+1}), \quad \sigma^2 = \frac{M}{n}
-$$
-
-This requires only **5 floats per feature per class** (count, mean, M-accumulator, and the derived variance), making it viable on ESP32's 320 KB SRAM.
-
-### Jerk Discrimination
-
-The **jerk** $J(t) = |a(t) - a(t-1)| / \Delta t$ measures how *abruptly* the acceleration changes. Genuine falls produce a characteristic sustained jerk signature (free-fall ramp → sharp impact spike). Jumps and stumbles produce a very short jerk spike without the preceding low-magnitude free-fall phase. The 3-phase engine rejects events that don't meet the temporal pattern.
-
-### Adaptive Confidence Threshold θ
-
-The threshold $\theta$ is initialised to 0.7 and updated after every confirmed event:
-
-$$
-\theta \leftarrow \theta + \alpha \cdot (\text{feedback} - \theta)
-$$
-
-where $\alpha = 0.1$ is the learning rate and **feedback** is 1.0 for a true fall or 0.0 for a non-fall, driven by the button press. This allows the device to personalise over time to each wearer.
-
----
-
-## Evaluation Metrics
-
-Fill in after running validation trials:
-
-| Metric | Value |
-|--------|-------|
-| Sensitivity (Recall) | — |
-| Specificity | — |
-| Detection latency (ms) | — |
-| False positives / hour | — |
-| True negatives / hour | — |
-
----
-
-## Paper Citation
-
-If you use FallGuard v2 in academic work, please cite:
-
-```bibtex
-@misc{fallguard2024,
-  author    = {Author, A. and Author, B.},
-  title     = {{FallGuard v2}: Adaptive Wearable Fall Detection with Online Gaussian Na\"{i}ve Bayes on ESP32},
-  year      = {2024},
-  note      = {GitHub: https://github.com/yourname/FallGuard-v2}
-}
+### 5.4 Offline Performance Analysis
+Analyze recorded experimental sessions and benchmark datasets:
+```bash
+python tools/analyze_results.py
 ```
 
 ---
 
-## File Structure
+## 6. Clinical & Benchmark Performance Metrics
 
-```
-FallGuard-v2/
-├── firmware/
-│   └── FallGuard_v2.ino        # Arduino sketch (ESP32 firmware)
-├── tools/
-│   └── logger.py               # Python serial logger + plotter
-├── docs/
-│   └── architecture.md         # Detailed algorithm & architecture doc
-├── results/
-│   └── .gitkeep                # Directory placeholder; CSVs saved here
-└── README.md
-```
-
----
-
-## License
-
-This project is released under the **MIT License**.
-
-```
-MIT License
-
-Copyright (c) 2024 FallGuard v2 Contributors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
+> **Empirical Validation Note:** Comprehensive clinical metrics across human subjects (elderly adults vs. active young adults) are **not yet measured on physical subject protocol**. Offline evaluation on benchmark telemetry is computed via `tools/analyze_results.py`.

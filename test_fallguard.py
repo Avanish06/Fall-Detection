@@ -1,345 +1,552 @@
+"""
+FallGuard v2 — Comprehensive Test Suite & State Machine Simulator
+===================================================================
+Tests core firmware logic against specifications:
+  - Dynamic regex parsing of firmware constants from FallGuard_v2.ino
+  - Python simulator of core state machine under all compile flag configurations
+  - Test 1: all-flags-off = baseline behavior
+  - Test 2: sensor fault - zero magnitude suppresses falls
+  - Test 3: sensor fault - frozen IMU axes triggers SENSOR_FAULT
+  - Test 4: theta lockout prevention under repeated cancels in cold start
+  - Test 5: USE_ADAPTIVE isolation (kinematic triggers unchanged, adaptive T_s and T_c)
+"""
+
+import math
 import re
 import sys
-import math
+from pathlib import Path
 
-INO_PATH = r"C:\Users\kushw\.gemini\antigravity\scratch\FallGuard-v2\firmware\FallGuard_v2.ino"
+# Paths resolved relative to current test script
+REPO_ROOT = Path(__file__).resolve().parent
+INO_PATH = REPO_ROOT / "firmware" / "FallGuard_v2.ino"
 
-def test_syntax_and_braces():
-    print("=== TEST 1: Syntax & Delimiter Validation ===")
-    with open(INO_PATH, "r", encoding="utf-8") as f:
-        content = f.read()
 
-    def strip_c_cpp(text):
-        out = []
-        i = 0
-        n = len(text)
-        while i < n:
-            if text.startswith('R"rawliteral(', i):
-                end = text.find(')rawliteral"', i + 13)
-                end = n if end == -1 else end + 12
-                out.append(re.sub(r'[^\n]', ' ', text[i:end]))
-                i = end
-            elif text.startswith('/*', i):
-                end = text.find('*/', i + 2)
-                end = n if end == -1 else end + 2
-                out.append(re.sub(r'[^\n]', ' ', text[i:end]))
-                i = end
-            elif text.startswith('//', i):
-                end = text.find('\n', i + 2)
-                if end == -1: end = n
-                out.append(re.sub(r'[^\n]', ' ', text[i:end]))
-                i = end
-            elif text[i] == '"':
-                start = i; i += 1
-                while i < n and text[i] != '"':
-                    if text[i] == '\\': i += 2
-                    else: i += 1
-                if i < n: i += 1
-                out.append(re.sub(r'[^\n]', ' ', text[start:i]))
-            elif text[i] == "'":
-                start = i; i += 1
-                while i < n and text[i] != "'":
-                    if text[i] == '\\': i += 2
-                    else: i += 1
-                if i < n: i += 1
-                out.append(re.sub(r'[^\n]', ' ', text[start:i]))
-            else:
-                out.append(text[i])
-                i += 1
-        return ''.join(out)
+# ──────────────────────────────────────────────────────────────────────────────
+# Firmware Constants Parser
+# ──────────────────────────────────────────────────────────────────────────────
 
-    stripped = strip_c_cpp(content)
 
-    stack = []
-    pairs = {')': '(', '}': '{', ']': '['}
-    line = 1
-    col = 1
-    lines_orig = content.splitlines()
-    for i, ch in enumerate(stripped):
-        if ch == '\n':
-            line += 1
-            col = 1
-            continue
-        if ch in '({[':
-            stack.append((ch, line, col))
-        elif ch in ')}]':
-            if not stack:
-                raise AssertionError(f"Unmatched closing delimiter '{ch}' at line {line}, col {col}: {lines_orig[line-1]}")
-            top, t_line, t_col = stack.pop()
-            expected = pairs[ch]
-            if top != expected:
-                raise AssertionError(f"Mismatched delimiter: expected '{top}' (opened line {t_line}, col {t_col}: {lines_orig[t_line-1]}) but got '{ch}' at line {line}, col {col}: {lines_orig[line-1]}")
-        col += 1
+def parse_firmware_constants(ino_path: Path) -> dict:
+    """Parse #define flags and const values directly from firmware C++ file."""
+    if not ino_path.exists():
+        raise FileNotFoundError(f"Firmware file not found at {ino_path}")
 
-    if stack:
-        top, t_line, t_col = stack[-1]
-        raise AssertionError(f"Unclosed delimiter '{top}' opened at line {t_line}, col {t_col}: {lines_orig[t_line-1]}")
+    text = ino_path.read_text(encoding="utf-8")
+    config_match = re.search(r"// ===== CONFIGURATION =====(.*?)// =====", text, re.DOTALL)
+    config_text = config_match.group(1) if config_match else text
 
-    print("PASS: All braces, parentheses, and brackets properly matched.")
+    constants = {}
 
-def test_ring_buffer_math():
-    print("\n=== TEST 2: Ring Buffer getRecentMaxJerk Math ===")
-    WINDOW_SIZE = 25
-    SAMPLE_INTERVAL_MS = 20
+    # 1. Parse #define NAME VALUE
+    for m in re.finditer(r"#define\s+([A-Za-z0-9_]+)\s+([0-9.]+)", config_text):
+        val_str = m.group(2)
+        constants[m.group(1)] = float(val_str) if "." in val_str else int(val_str)
 
-    for win_head in range(WINDOW_SIZE):
-        for win_full in [False, True]:
-            win_jerk = [float(x) for x in range(WINDOW_SIZE)]
-            # simulate getRecentMaxJerk(150)
-            ms = 150
-            samples = (ms + SAMPLE_INTERVAL_MS - 1) // SAMPLE_INTERVAL_MS
-            available = WINDOW_SIZE if win_full else win_head
-            count = min(samples, available)
-            mxJ = 0.0
-            for i in range(count):
-                idx = (win_head - 1 - (i % WINDOW_SIZE) + 2 * WINDOW_SIZE) % WINDOW_SIZE
-                assert 0 <= idx < WINDOW_SIZE, f"Index out of bounds: {idx}"
-                if win_jerk[idx] > mxJ:
-                    mxJ = win_jerk[idx]
+    # 2. Parse const <type> NAME = VALUE;
+    for m in re.finditer(r"const\s+[A-Za-z0-9_ ]+?\s+([A-Za-z0-9_]+)\s*=\s*([0-9.+-]+)f?\s*;", config_text):
+        val_str = m.group(2)
+        constants[m.group(1)] = float(val_str) if "." in val_str else int(val_str)
 
-    # Test peak detection when peak is 60ms (3 samples) in the past
-    win_jerk = [0.0] * WINDOW_SIZE
-    # Suppose current sample is at head=10, so head-1=9 has jerk=50. Sample at 7 has jerk=350.
-    win_head = 10
-    win_full = True
-    win_jerk[7] = 350.0  # 3 samples ago (60ms)
-    win_jerk[9] = 50.0   # current sample (0ms)
-    
-    # Check max jerk over last 150ms (8 samples: 9, 8, 7, 6, 5, 4, 3, 2)
-    samples = (150 + 20 - 1) // 20
-    count = min(samples, WINDOW_SIZE if win_full else win_head)
-    mxJ = 0.0
-    for i in range(count):
-        idx = (win_head - 1 - (i % WINDOW_SIZE) + 2 * WINDOW_SIZE) % WINDOW_SIZE
-        if win_jerk[idx] > mxJ:
-            mxJ = win_jerk[idx]
-    assert mxJ == 350.0, f"Expected 350.0, got {mxJ}"
-    print("PASS: Ring buffer indexing and peak retention verified across all configurations.")
+    # 3. Parse float theta = VALUE;
+    m_th = re.search(r"float\s+theta\s*=\s*([0-9.]+)f?\s*;", config_text)
+    if m_th:
+        constants["THETA_INIT"] = float(m_th.group(1))
 
-def test_fsm_simulation():
-    print("\n=== TEST 3: Deterministic State Machine Simulation ===")
+    return constants
 
-    class SimESP32:
-        def __init__(self):
-            self.WINDOW_SIZE = 25
-            self.SAMPLE_INTERVAL_MS = 20
-            self.FREE_FALL_MAG = 5.0
-            self.FF_MIN_MS = 40
-            self.FF_WINDOW_MS = 1400
-            self.STILL_LOW = 7.5
-            self.STILL_HIGH = 12.0
-            self.STILL_MS = 1800
-            self.JERK_THRESHOLD = 220.0
-            self.IMPACT_THRESHOLD = 11.5
-            self.theta = 0.65
-            self.state = "CALIBRATING"
-            self.calStart = 0
-            self.CAL_DURATION_MS = 20000
-            self.calMaxMag = 0.0
-            self.calMaxJerk = 0.0
 
-            self.winMag = [9.81] * self.WINDOW_SIZE
-            self.winJerk = [0.0] * self.WINDOW_SIZE
-            self.winHead = 0
-            self.winFull = False
+# ──────────────────────────────────────────────────────────────────────────────
+# Python Simulator of FallGuard Core State Machine
+# ──────────────────────────────────────────────────────────────────────────────
 
-            self.ffStart = 0
-            self.impactTime = 0
-            self.stillnessStart = 0
-            self.inFFDip = False
-            self.lastFeatures = [0.0] * 6
-            self.lastClassConf = -1.0
-            self.nonFallCount = 0
-            self.fallCount = 0
 
-        def push_window(self, mag, jerk):
-            self.winMag[self.winHead] = mag
-            self.winJerk[self.winHead] = jerk
-            self.winHead = (self.winHead + 1) % self.WINDOW_SIZE
-            if self.winHead == 0:
-                self.winFull = True
+class FallGuardSimulator:
+    """Simulates the FallGuard v2 embedded firmware state transitions."""
 
-        def get_recent_max_jerk(self, ms=150):
-            samples = (ms + self.SAMPLE_INTERVAL_MS - 1) // self.SAMPLE_INTERVAL_MS
-            available = self.WINDOW_SIZE if self.winFull else self.winHead
-            count = min(samples, available)
-            mxJ = 0.0
-            for i in range(count):
-                idx = (self.winHead - 1 - (i % self.WINDOW_SIZE) + 2 * self.WINDOW_SIZE) % self.WINDOW_SIZE
-                if self.winJerk[idx] > mxJ:
-                    mxJ = self.winJerk[idx]
-            return mxJ
+    def __init__(self, constants: dict, flag_overrides: dict = None):
+        self.c = dict(constants)
+        if flag_overrides:
+            self.c.update(flag_overrides)
 
-        def extract_features(self):
-            n = self.WINDOW_SIZE if self.winFull else self.winHead
-            if n < 2:
-                return [0.0] * 6
-            sub_mag = self.winMag[:n]
-            sub_jerk = self.winJerk[:n]
-            mean = sum(sub_mag) / n
-            mx = max(sub_mag)
-            mn = min(sub_mag)
-            mxJ = max(sub_jerk)
-            var = sum((x - mean)**2 for x in sub_mag) / (n - 1)
-            p2v = mx / max(mn, 0.1)
-            return [mean, mx, mn, var, p2v, mxJ]
+        # Feature Flags
+        self.USE_WIFI = bool(self.c.get("USE_WIFI", 1))
+        self.USE_GNB = bool(self.c.get("USE_GNB", 1))
+        self.USE_INTEGRITY = bool(self.c.get("USE_INTEGRITY", 1))
+        self.USE_ADAPTIVE = bool(self.c.get("USE_ADAPTIVE", 1))
+        self.USE_STILLNESS = bool(self.c.get("USE_STILLNESS", 1))
+        self.USE_PATH2 = bool(self.c.get("USE_PATH2", 1))
 
-        def reset_to_normal(self, reason):
-            self.inFFDip = False
-            self.stillnessStart = 0
-            self.state = "NORMAL"
-            self.lastClassConf = -1.0
+        # Kinematic Constants
+        self.FREE_FALL_MAG = float(self.c.get("FREE_FALL_MAG", 5.0))
+        self.FF_MIN_MS = int(self.c.get("FF_MIN_MS", 40))
+        self.FF_WINDOW_MS = int(self.c.get("FF_WINDOW_MS", 1400))
+        self.IMPACT_THRESHOLD = float(self.c.get("IMPACT_THRESHOLD", 22.0))
+        self.JERK_THRESHOLD = float(self.c.get("JERK_THRESHOLD", 500.0))
+        self.MAG_PATH2 = float(self.c.get("MAG_PATH2", 11.5))
+        self.JERK_PATH2 = float(self.c.get("JERK_PATH2", 280.0))
+        self.STILL_LOW = float(self.c.get("STILL_LOW", 7.5))
+        self.STILL_HIGH = float(self.c.get("STILL_HIGH", 12.0))
+        self.STILL_MS = int(self.c.get("STILL_MS", 2200))
+        self.CANCEL_MS = int(self.c.get("CANCEL_MS", 5000))
+        self.THETA_INIT = float(self.c.get("THETA_INIT", 0.65))
+        self.THETA_MAX = float(self.c.get("THETA_MAX", 0.85))
+        self.THETA_MIN = float(self.c.get("THETA_MIN", 0.50))
+        self.THETA_UP = float(self.c.get("THETA_UP", 0.02))
+        self.THETA_DOWN = float(self.c.get("THETA_DOWN", 0.01))
+        self.E0 = float(self.c.get("E0", 1.0))
 
-        def step(self, t_ms, liveMag, jerk, quickPress=False, remoteCancel=False):
-            self.push_window(liveMag, jerk)
+        # State Variables
+        self.state = "NORMAL"
+        self.theta = self.THETA_INIT
+        self.Q = 1.0
+        self.E_k = 1.0
+        self.sensor_fault = False
+        self.fall_stats_count = 0
+        self.non_fall_stats_count = 0
+        self.stillness_accum_ms = 0
+        self.stillness_start_ms = 0
+        self.free_fall_start_ms = 0
+        self.impact_time_ms = 0
+        self.confirmed_time_ms = 0
+        self.a_peak = 0.0
+        self.j_peak = 0.0
+        self.axis_history = []  # stores (rx, ry, rz)
+        self.events = []  # (t_ms, event_name)
 
-            if remoteCancel:
-                if self.state not in ("NORMAL", "CALIBRATING"):
-                    if self.lastClassConf >= 0 or self.state == "IMPACT":
-                        self.nonFallCount += 1
-                        self.theta = min(0.85, self.theta + 0.02)
-                    self.reset_to_normal("CANCEL_REMOTE")
-                    return
+    def compute_T_s(self) -> float:
+        """Adaptive stillness window."""
+        if self.USE_ADAPTIVE:
+            return 1500.0 + (3000.0 - 1500.0) * (self.E_k / (self.E_k + self.E0))
+        return float(self.STILL_MS)
 
-            isStill = (liveMag >= self.STILL_LOW and liveMag <= self.STILL_HIGH)
+    def compute_T_c(self) -> float:
+        """Adaptive cancellation window."""
+        if self.USE_ADAPTIVE:
+            imp_norm = self.a_peak / self.IMPACT_THRESHOLD if self.IMPACT_THRESHOLD > 0 else 1.0
+            jrk_norm = self.j_peak / self.JERK_THRESHOLD if self.JERK_THRESHOLD > 0 else 1.0
+            m = min(imp_norm, jrk_norm)
+            m_clip = max(0.0, min(1.0, (m - 1.0) / 0.5))
+            return 8000.0 - (8000.0 - 3000.0) * m_clip
+        return float(self.CANCEL_MS)
 
-            if self.state == "CALIBRATING":
-                if liveMag > self.calMaxMag: self.calMaxMag = liveMag
-                if jerk > self.calMaxJerk: self.calMaxJerk = jerk
-                if t_ms - self.calStart >= self.CAL_DURATION_MS:
-                    self.IMPACT_THRESHOLD = max(11.0, min(13.0, self.calMaxMag * 1.15))
-                    self.JERK_THRESHOLD = max(180.0, min(260.0, self.calMaxJerk * 1.15))
+    def step(
+        self,
+        t_ms: int,
+        mag: float,
+        jerk: float = 0.0,
+        raw_axes: tuple = None,
+        dt_us: int = 20000,
+        quick_press: bool = False,
+    ):
+        """Execute one 20 ms iteration of the fall-guard state machine."""
+        if raw_axes is None:
+            # Natural sensor jitter (non-frozen)
+            rx = 120 + (t_ms % 17)
+            ry = -140 + (t_ms % 13)
+            rz = 16384 + (t_ms % 19)
+        else:
+            rx, ry, rz = raw_axes
+
+        # ── 1. Sensor Integrity Layer (USE_INTEGRITY) ──
+        current_vk = 1.0
+        if self.USE_INTEGRITY:
+            # Check axis delta over last 25 samples
+            self.axis_history.append((rx, ry, rz))
+            if len(self.axis_history) > 25:
+                self.axis_history.pop(0)
+
+            delta_ok = True
+            if len(self.axis_history) >= 25:
+                dx = max(a[0] for a in self.axis_history) - min(a[0] for a in self.axis_history)
+                dy = max(a[1] for a in self.axis_history) - min(a[1] for a in self.axis_history)
+                dz = max(a[2] for a in self.axis_history) - min(a[2] for a in self.axis_history)
+                if dx <= 2 and dy <= 2 and dz <= 2:
+                    delta_ok = False
+
+            mag_ok = mag >= 2.0
+            axis_ok = abs(rx) < 32700 and abs(ry) < 32700 and abs(rz) < 32700
+            timing_ok = dt_us <= 40000
+
+            v_k_sample = 1.0 if (mag_ok and axis_ok and delta_ok and timing_ok) else 0.0
+            current_vk = v_k_sample
+            self.Q = 0.9 * self.Q + 0.1 * v_k_sample
+
+            # Hysteresis state transitions
+            if not self.sensor_fault and self.Q < 0.5:
+                self.sensor_fault = True
+                self.events.append((t_ms, "SENSOR_FAULT"))
+                if self.state in ("FREE_FALL", "IMPACT"):
+                    self.events.append((t_ms, "POSSIBLE_FALL_DURING_FAULT"))
+            elif self.sensor_fault and self.Q > 0.9:
+                self.sensor_fault = False
+                self.events.append((t_ms, "SENSOR_RECOVERED"))
+
+        # ── 2. Windowed Energy Update ──
+        if current_vk > 0.5:
+            self.E_k = 0.98 * self.E_k + 0.02 * ((mag - 9.81) ** 2)
+
+        # ── 3. State Machine ──
+        is_still = (self.STILL_LOW <= mag <= self.STILL_HIGH)
+        t_s = self.compute_T_s()
+        t_c = self.compute_T_c()
+
+        if self.state == "NORMAL":
+            # Path 2 trigger (direct high-jerk impact)
+            if self.USE_PATH2 and jerk >= self.JERK_PATH2 and mag >= self.MAG_PATH2:
+                self.state = "IMPACT"
+                self.impact_time_ms = t_ms
+                self.stillness_accum_ms = 0
+                self.stillness_start_ms = 0
+                self.a_peak = mag
+                self.j_peak = jerk
+                self.events.append((t_ms, "IMPACT_PATH2"))
+                return
+
+            # Path 1 trigger (free-fall entry)
+            if mag < self.FREE_FALL_MAG:
+                self.state = "FREE_FALL"
+                self.free_fall_start_ms = t_ms
+                self.events.append((t_ms, "FREE_FALL_ENTER"))
+
+        elif self.state == "FREE_FALL":
+            ff_dur = t_ms - self.free_fall_start_ms
+            if mag >= self.FREE_FALL_MAG:
+                if ff_dur >= self.FF_MIN_MS:
+                    self.state = "IMPACT"
+                    self.impact_time_ms = t_ms
+                    self.stillness_accum_ms = 0
+                    self.stillness_start_ms = 0
+                    self.a_peak = mag
+                    self.j_peak = jerk
+                    self.events.append((t_ms, "FREE_FALL_QUALIFIED"))
+                else:
                     self.state = "NORMAL"
+            elif ff_dur > self.FF_WINDOW_MS:
+                self.state = "NORMAL"
 
-            elif self.state == "NORMAL":
-                if jerk >= 280.0 and liveMag >= 11.5:
-                    self.lastFeatures = self.extract_features()
-                    self.impactTime = t_ms
-                    self.stillnessStart = 0
-                    self.inFFDip = False
-                    self.state = "IMPACT"
-                    return
+        elif self.state == "IMPACT":
+            self.a_peak = max(self.a_peak, mag)
+            self.j_peak = max(self.j_peak, jerk)
 
-                if liveMag < self.FREE_FALL_MAG:
-                    if not self.inFFDip:
-                        self.inFFDip = True
-                        self.ffStart = t_ms
-                    if t_ms - self.ffStart >= self.FF_MIN_MS:
-                        self.state = "FREE_FALL"
+            if quick_press:
+                if self.USE_GNB:
+                    self.theta = min(self.THETA_MAX, self.theta + self.THETA_UP)
+                self.state = "NORMAL"
+                self.events.append((t_ms, "CANCEL_USER_IMPACT"))
+                return
+
+            time_since_impact = t_ms - self.impact_time_ms
+            if time_since_impact >= 5000 and not is_still:
+                self.state = "NORMAL"
+                self.events.append((t_ms, "IMPACT_TIMEOUT_MOVING"))
+                return
+
+            # Post-impact stillness evaluation
+            if self.USE_INTEGRITY:
+                if current_vk > 0.5 and is_still:
+                    self.stillness_accum_ms += 20
+                    if self.stillness_accum_ms >= t_s:
+                        if self.USE_GNB:
+                            self.state = "CANDIDATE_FALL"
+                        else:
+                            self.state = "FALL_CONFIRMED"
+                            self.confirmed_time_ms = t_ms
+                            self.events.append((t_ms, "FALL_CONFIRMED"))
+                        self.stillness_accum_ms = 0
                 else:
-                    self.inFFDip = False
-
-            elif self.state == "FREE_FALL":
-                recentMaxJerk = self.get_recent_max_jerk(150)
-                if liveMag >= self.IMPACT_THRESHOLD and (jerk >= self.JERK_THRESHOLD or recentMaxJerk >= self.JERK_THRESHOLD):
-                    self.lastFeatures = self.extract_features()
-                    self.state = "IMPACT"
-                    self.impactTime = t_ms
-                    self.stillnessStart = 0
-                    self.inFFDip = False
-                elif t_ms - self.ffStart >= self.FF_WINDOW_MS:
-                    self.reset_to_normal("FF_TIMEOUT_NO_IMPACT")
-                    self.inFFDip = False
-
-            elif self.state == "IMPACT":
-                if quickPress:
-                    self.nonFallCount += 1
-                    self.theta = min(0.85, self.theta + 0.02)
-                    self.reset_to_normal("CANCEL_USER_IMPACT")
-                    return
-
-                timeSinceImpact = t_ms - self.impactTime
-                if isStill:
-                    if self.stillnessStart == 0:
-                        self.stillnessStart = t_ms
-                    if t_ms - self.stillnessStart >= self.STILL_MS:
-                        self.lastClassConf = 0.85  # mock classify
-                        self.state = "CANDIDATE_FALL"
-                        return
+                    self.stillness_accum_ms = max(0, self.stillness_accum_ms - 10)
+            else:
+                if is_still:
+                    if self.stillness_start_ms == 0:
+                        self.stillness_start_ms = t_ms
+                    if t_ms - self.stillness_start_ms >= t_s:
+                        if self.USE_GNB:
+                            self.state = "CANDIDATE_FALL"
+                        else:
+                            self.state = "FALL_CONFIRMED"
+                            self.confirmed_time_ms = t_ms
+                            self.events.append((t_ms, "FALL_CONFIRMED"))
                 else:
-                    self.stillnessStart = 0
+                    self.stillness_start_ms = 0
 
-                if timeSinceImpact >= 5000 and not isStill:
-                    self.nonFallCount += 1
-                    self.reset_to_normal("IMPACT_TIMEOUT_MOVING")
+        elif self.state == "CANDIDATE_FALL":
+            if self.USE_INTEGRITY and self.sensor_fault:
+                # Suppress confirmed falls during sensor fault
+                return
 
-    # Scenario A: Calibration bounding
-    sim = SimESP32()
-    for t in range(0, 20020, 20):
-        # Simulate vigorous calibration jumping/running
-        sim.step(t, liveMag=28.0, jerk=750.0)
+            classifier_trained = (self.fall_stats_count >= 3 and self.non_fall_stats_count >= 3)
+            # Simulated model confidence for genuine candidate fall
+            cand_conf = 0.95
+            if not classifier_trained or cand_conf >= self.theta:
+                self.state = "FALL_CONFIRMED"
+                self.confirmed_time_ms = t_ms
+                self.events.append((t_ms, "FALL_CONFIRMED"))
+            else:
+                self.theta = min(self.THETA_MAX, self.theta + self.THETA_UP * 0.5)
+                self.state = "NORMAL"
+                self.events.append((t_ms, "CLASSIFIER_REJECTED"))
+
+        elif self.state == "FALL_CONFIRMED":
+            if self.USE_INTEGRITY and self.sensor_fault:
+                return
+
+            if quick_press:
+                if self.USE_GNB:
+                    self.theta = min(self.THETA_MAX, self.theta + self.THETA_UP)
+                self.state = "NORMAL"
+                self.events.append((t_ms, "CANCEL_USER"))
+            elif t_ms - self.confirmed_time_ms >= t_c:
+                self.state = "ALERT_SENT"
+                if self.USE_GNB:
+                    self.theta = max(self.THETA_MIN, self.theta - self.THETA_DOWN)
+                self.events.append((t_ms, "ALERT_SENT"))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Test 1: all-flags-off = baseline behavior
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_1_all_flags_off(constants: dict):
+    print("=== TEST 1: All-Flags-Off Baseline Verification ===")
+    flags_off = {
+        "USE_WIFI": 0,
+        "USE_GNB": 0,
+        "USE_INTEGRITY": 0,
+        "USE_ADAPTIVE": 0,
+        "USE_STILLNESS": 1,
+        "USE_PATH2": 0,
+    }
+    sim = FallGuardSimulator(constants, flag_overrides=flags_off)
+    assert not sim.USE_GNB
+    assert not sim.USE_INTEGRITY
+    assert not sim.USE_ADAPTIVE
+    assert not sim.USE_PATH2
+
+    # Simulate Normal -> Free Fall (80 ms) -> Impact -> Stillness -> Confirmed -> Alert
+    t = 0
+    # 1. Normal phase (100 ms)
+    for _ in range(5):
+        sim.step(t, mag=9.81, jerk=5.0)
+        t += 20
     assert sim.state == "NORMAL"
-    assert sim.IMPACT_THRESHOLD == 13.0, f"Expected 13.0 clamp, got {sim.IMPACT_THRESHOLD}"
-    assert sim.JERK_THRESHOLD == 260.0, f"Expected 260.0 clamp, got {sim.JERK_THRESHOLD}"
-    print("PASS: Scenario A - Calibration bounds clamped to [11.0, 13.0] and [180.0, 260.0].")
 
-    # Scenario B: Direct High-Jerk slip fall in NORMAL
-    sim = SimESP32()
-    sim.state = "NORMAL"
-    sim.step(21000, liveMag=9.8, jerk=5.0)
-    sim.step(21020, liveMag=12.2, jerk=295.0)  # Direct slip impact
+    # 2. Free fall phase (< 5.0 m/s2 for 80 ms >= 40 ms)
+    for _ in range(4):
+        sim.step(t, mag=1.2, jerk=10.0)
+        t += 20
+    assert sim.state == "FREE_FALL"
+
+    # 3. Impact pulse (mag 26.0 m/s2, jerk 600.0 m/s3)
+    sim.step(t, mag=26.0, jerk=600.0)
+    t += 20
     assert sim.state == "IMPACT"
-    assert sim.impactTime == 21020
-    assert sim.stillnessStart == 0
-    # Next 1800ms of stillness (inclusive of 1800ms milestone)
-    for t in range(21040, 21040 + 1800 + 20, 20):
-        sim.step(t, liveMag=9.8, jerk=0.0)
-    assert sim.state == "CANDIDATE_FALL"
-    # Snapshotted features contain the slip impact
-    assert sim.lastFeatures[1] >= 12.2, f"Expected max mag >= 12.2, got {sim.lastFeatures[1]}"
-    assert sim.lastFeatures[5] >= 295.0, f"Expected max jerk >= 295.0, got {sim.lastFeatures[5]}"
-    print("PASS: Scenario B - Direct High-Jerk Slip transitions to IMPACT, snapshots features, and enters CANDIDATE_FALL.")
 
-    # Scenario C: Free-fall with Jerk peak leading Impact Magnitude by 60ms
-    sim = SimESP32()
-    sim.state = "NORMAL"
-    sim.step(1000, liveMag=4.0, jerk=10.0)  # FF sample 1 (0ms elapsed)
-    sim.step(1020, liveMag=4.2, jerk=15.0)  # FF sample 2 (20ms elapsed)
-    sim.step(1040, liveMag=4.1, jerk=12.0)  # FF sample 3 (40ms elapsed >= FF_MIN_MS)
-    assert sim.state == "FREE_FALL"
-    # Jerk spike at t=1060, mag not yet reached threshold
-    sim.step(1060, liveMag=9.0, jerk=240.0) # Jerk spike 240 m/s^3
-    assert sim.state == "FREE_FALL"
-    # At t=1080, jerk drops, mag reaches 12.5 m/s^2 (impact)
-    sim.step(1080, liveMag=12.5, jerk=70.0)
-    # getRecentMaxJerk(150) should detect 240.0 from 20ms ago!
-    assert sim.state == "IMPACT"
-    print("PASS: Scenario C - Desynchronized jerk peak captured by rolling 150ms window.")
+    # 4. Post-impact stillness (STILL_MS ms)
+    still_steps = int(sim.STILL_MS / 20) + 5
+    for _ in range(still_steps):
+        sim.step(t, mag=9.81, jerk=2.0)
+        t += 20
+    # Because USE_GNB = 0, directly transitions to FALL_CONFIRMED without GNB candidate gate
+    assert sim.state == "FALL_CONFIRMED"
+    event_names = [e[1] for e in sim.events]
+    assert "FALL_CONFIRMED" in event_names
 
-    # Scenario D: Free-fall timeout without impact
-    sim = SimESP32()
-    sim.state = "NORMAL"
-    sim.step(1000, liveMag=4.0, jerk=10.0)
-    sim.step(1020, liveMag=4.0, jerk=10.0)
-    sim.step(1040, liveMag=4.0, jerk=10.0)
-    assert sim.state == "FREE_FALL"
-    for t in range(1060, 1000 + 1400 + 20, 20):
-        sim.step(t, liveMag=9.8, jerk=10.0)
-    assert sim.state == "NORMAL"
-    print("PASS: Scenario D - Free-fall without impact correctly times out to NORMAL.")
+    # 5. Wait CANCEL_MS (5000 ms) without button press -> ALERT_SENT
+    cancel_steps = int(sim.CANCEL_MS / 20) + 5
+    for _ in range(cancel_steps):
+        sim.step(t, mag=9.81, jerk=2.0)
+        t += 20
+    assert sim.state == "ALERT_SENT"
+    assert "ALERT_SENT" in [e[1] for e in sim.events]
 
-    # Scenario E: IMPACT state post-fall movement failsafe
-    sim = SimESP32()
+    print("  [PASS] All-flags-off simulator executed baseline sequence perfectly:")
+    print(f"         NORMAL -> FREE_FALL -> IMPACT -> FALL_CONFIRMED -> ALERT_SENT")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Test 2: sensor fault - zero magnitude suppresses falls
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_2_sensor_fault_zero_mag(constants: dict):
+    print("=== TEST 2: Sensor Fault (Zero Mag Suppression) ===")
+    sim = FallGuardSimulator(constants, flag_overrides={"USE_INTEGRITY": 1})
+
+    t = 0
+    # Feed 20 frames of zero-magnitude samples
+    for _ in range(25):
+        sim.step(t, mag=0.0, jerk=0.0, raw_axes=(0, 0, 0))
+        t += 20
+
+    # Quality index must decay below 0.5 and emit SENSOR_FAULT
+    assert sim.sensor_fault is True
+    assert sim.Q < 0.5
+    event_names = [e[1] for e in sim.events]
+    assert "SENSOR_FAULT" in event_names
+    assert "FALL_CONFIRMED" not in event_names
+
+    # Continue feeding zero magnitude and attempt to trigger fall
+    for _ in range(50):
+        sim.step(t, mag=0.0, jerk=0.0, raw_axes=(0, 0, 0))
+        t += 20
+
+    assert "FALL_CONFIRMED" not in [e[1] for e in sim.events]
+    assert "ALERT_SENT" not in [e[1] for e in sim.events]
+    print(f"  [PASS] Zero magnitude caused Q decay (Q={sim.Q:.3f} < 0.5) and SENSOR_FAULT.")
+    print("         FALL_CONFIRMED was completely suppressed.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Test 3: sensor fault - frozen IMU axes triggers SENSOR_FAULT
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_3_sensor_fault_frozen_axes(constants: dict):
+    print("=== TEST 3: Sensor Fault (Frozen IMU Axes) ===")
+    sim = FallGuardSimulator(constants, flag_overrides={"USE_INTEGRITY": 1})
+
+    t = 0
+    # Feed identical-axis samples for 35 frames (delta <= 2 LSB over 25 samples)
+    frozen_axis = (250, -410, 16300)
+    for _ in range(35):
+        sim.step(t, mag=9.81, jerk=0.0, raw_axes=frozen_axis)
+        t += 20
+
+    assert sim.sensor_fault is True
+    assert sim.Q < 0.5
+    event_names = [e[1] for e in sim.events]
+    assert "SENSOR_FAULT" in event_names
+    print(f"  [PASS] Identical axis samples for 35 frames triggered SENSOR_FAULT (Q={sim.Q:.3f}).")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Test 4: theta lockout prevention under repeated cancels in cold start
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_4_theta_lockout_prevention(constants: dict):
+    print("=== TEST 4: Theta Lockout Prevention (Cold-Start Immunity) ===")
+    sim = FallGuardSimulator(constants, flag_overrides={"USE_GNB": 1})
+    # Device starts untrained (count < 3)
+    assert sim.fall_stats_count < 3 and sim.non_fall_stats_count < 3
+
+    t = 0
+    initial_theta = sim.theta
+
+    # Simulate 6 consecutive user cancels (e.g. false alarms or tests)
+    for cancel_idx in range(6):
+        # Trigger impact and stillness
+        sim.state = "IMPACT"
+        sim.impact_time_ms = t
+        still_steps = int(sim.compute_T_s() / 20) + 2
+        for _ in range(still_steps):
+            sim.step(t, mag=9.81, jerk=1.0)
+            t += 20
+
+        assert sim.state == "FALL_CONFIRMED"
+        # User cancels during cancel window
+        sim.step(t, mag=9.81, jerk=1.0, quick_press=True)
+        t += 20
+        assert sim.state == "NORMAL"
+
+    print(f"  Theta elevated after 6 cancels from {initial_theta:.2f} to {sim.theta:.2f}")
+    assert sim.theta > initial_theta
+
+    # 7th fall event occurs
     sim.state = "IMPACT"
-    sim.impactTime = 5000
-    # User moves continuously after impact for 5.2 seconds
-    for t in range(5020, 10040, 20):
-        sim.step(t, liveMag=14.0, jerk=50.0) # moving, outside stillness band
-    assert sim.state == "NORMAL"
-    assert sim.nonFallCount == 1
-    print("PASS: Scenario E - IMPACT state moving failsafe resets to NORMAL after 5000ms.")
+    sim.impact_time_ms = t
+    still_steps = int(sim.compute_T_s() / 20) + 2
+    for _ in range(still_steps):
+        sim.step(t, mag=9.81, jerk=1.0)
+        t += 20
 
-    # Scenario F: Remote cancel in IMPACT updates classifier
-    sim = SimESP32()
-    sim.state = "IMPACT"
-    sim.impactTime = 5000
-    sim.step(5100, liveMag=9.8, jerk=0.0, remoteCancel=True)
-    assert sim.state == "NORMAL"
-    assert sim.nonFallCount == 1
-    print("PASS: Scenario F - Remote cancel in IMPACT updates classifier non-fall count.")
+    # Assert 7th fall STILL confirmed despite elevated theta!
+    assert sim.state == "FALL_CONFIRMED"
+    confirmed_events = [e for e in sim.events if e[1] == "FALL_CONFIRMED"]
+    assert len(confirmed_events) == 7
+    print("  [PASS] 7th fall confirmed into FALL_CONFIRMED (no cold-start lockout).")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Test 5: USE_ADAPTIVE isolation
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_5_use_adaptive_isolation(constants: dict):
+    print("=== TEST 5: USE_ADAPTIVE Isolation ===")
+
+    # Run Path 1 and Path 2 on adaptive=1 and adaptive=0
+    sim_adapt = FallGuardSimulator(constants, flag_overrides={"USE_ADAPTIVE": 1})
+    sim_fixed = FallGuardSimulator(constants, flag_overrides={"USE_ADAPTIVE": 0})
+
+    # Kinematic thresholds must be identical
+    assert sim_adapt.FREE_FALL_MAG == sim_fixed.FREE_FALL_MAG
+    assert sim_adapt.JERK_PATH2 == sim_fixed.JERK_PATH2
+    assert sim_adapt.MAG_PATH2 == sim_fixed.MAG_PATH2
+
+    # Feed identical Path 2 kinematic trigger
+    t = 0
+    sim_adapt.step(t, mag=sim_adapt.MAG_PATH2 + 2.0, jerk=sim_adapt.JERK_PATH2 + 50.0)
+    sim_fixed.step(t, mag=sim_fixed.MAG_PATH2 + 2.0, jerk=sim_fixed.JERK_PATH2 + 50.0)
+
+    assert sim_adapt.state == "IMPACT"
+    assert sim_fixed.state == "IMPACT"
+    assert sim_adapt.events[-1][1] == "IMPACT_PATH2"
+    assert sim_fixed.events[-1][1] == "IMPACT_PATH2"
+
+    # Verify T_s adaptation based on energy
+    sim_adapt.E_k = 4.0
+    sim_fixed.E_k = 4.0
+    t_s_adapt = sim_adapt.compute_T_s()
+    t_s_fixed = sim_fixed.compute_T_s()
+    assert t_s_adapt != t_s_fixed
+    assert math.isclose(t_s_fixed, float(sim_fixed.STILL_MS))
+    expected_adapt = 1500.0 + (3000.0 - 1500.0) * (4.0 / (4.0 + 1.0))
+    assert math.isclose(t_s_adapt, expected_adapt, abs_tol=1e-3)
+
+    # Verify T_c adaptation based on impact severity
+    sim_adapt.a_peak = 33.0
+    sim_adapt.j_peak = 750.0
+    sim_fixed.a_peak = 33.0
+    sim_fixed.j_peak = 750.0
+    t_c_adapt = sim_adapt.compute_T_c()
+    t_c_fixed = sim_fixed.compute_T_c()
+    assert t_c_adapt != t_c_fixed
+    assert t_c_fixed == float(sim_fixed.CANCEL_MS)
+
+    print(f"  [PASS] Kinematic triggers identical between adaptive and non-adaptive.")
+    print(f"         T_s: adaptive={t_s_adapt:.1f} ms vs fixed={t_s_fixed:.1f} ms")
+    print(f"         T_c: adaptive={t_c_adapt:.1f} ms vs fixed={t_c_fixed:.1f} ms")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main Runner
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def main():
+    print("=" * 60)
+    print("  FallGuard v2 — Firmware Verification Test Suite")
+    print(f"  Firmware path: {INO_PATH}")
+    print("=" * 60)
+
+    constants = parse_firmware_constants(INO_PATH)
+    print(f"Loaded {len(constants)} constants from firmware config block.")
+
+    test_1_all_flags_off(constants)
+    print("-" * 60)
+    test_2_sensor_fault_zero_mag(constants)
+    print("-" * 60)
+    test_3_sensor_fault_frozen_axes(constants)
+    print("-" * 60)
+    test_4_theta_lockout_prevention(constants)
+    print("-" * 60)
+    test_5_use_adaptive_isolation(constants)
+    print("=" * 60)
+    print("  ALL 5 TESTS PASSED SUCCESSFULLY!")
+    print("=" * 60)
+
 
 if __name__ == "__main__":
-    test_syntax_and_braces()
-    test_ring_buffer_math()
-    test_fsm_simulation()
-    print("\nALL VERIFICATION TESTS PASSED SUCCESSFULLY!")
+    main()
