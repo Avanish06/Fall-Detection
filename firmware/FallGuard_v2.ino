@@ -100,6 +100,25 @@ enum FallState {
 };
 FallState state = CALIBRATING;
 
+// --- Sensor Integrity State (USE_INTEGRITY) ---
+#if USE_INTEGRITY
+float Q = 1.0f;
+bool  sensorFault = false;
+unsigned long faultStartTime = 0;
+unsigned long stillnessAccumMs = 0;
+
+const int AXIS_HIST_SIZE = 25;
+int16_t histX[AXIS_HIST_SIZE];
+int16_t histY[AXIS_HIST_SIZE];
+int16_t histZ[AXIS_HIST_SIZE];
+int axisHistHead = 0;
+int axisHistCount = 0;
+float current_vk = 1.0f;
+
+const unsigned long PAT_FAULT[] = {100, 100, 100, 100, 100, 600};
+const int           PAT_FAULT_N = 6;
+#endif
+
 // --- Sliding window ---
 float winMag[WINDOW_SIZE];
 float winJerk[WINDOW_SIZE];
@@ -170,24 +189,38 @@ float liveMag  = 9.81f;
 float liveJerk = 0.0f;
 
 // ============================================================================
-//  UTILITY - MPU6050 raw read
+//  UTILITY - MPU6050 IMU read
 // ============================================================================
 
-float readRawMagnitude() {
+bool readIMU(int16_t& rx, int16_t& ry, int16_t& rz, float& mag) {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x3B);
-  Wire.endTransmission(false);
-  Wire.requestFrom(MPU_ADDR, 6, true);
-  int16_t rx = (int16_t)(Wire.read() << 8 | Wire.read());
-  int16_t ry = (int16_t)(Wire.read() << 8 | Wire.read());
-  int16_t rz = (int16_t)(Wire.read() << 8 | Wire.read());
+  uint8_t txStatus = Wire.endTransmission(false);
+  uint8_t readCount = Wire.requestFrom(MPU_ADDR, 6, true);
+  bool i2c_ok = (txStatus == 0) && (readCount == 6) && (Wire.available() >= 6);
+  if (i2c_ok) {
+    rx = (int16_t)(Wire.read() << 8 | Wire.read());
+    ry = (int16_t)(Wire.read() << 8 | Wire.read());
+    rz = (int16_t)(Wire.read() << 8 | Wire.read());
 
-  // ±2g clips at impact; ±8g needed per IEEE paper Section III-A
-  // Scale factor: 4096 LSB/g at ±8g sensitivity
-  float ax = rx / 4096.0f;
-  float ay = ry / 4096.0f;
-  float az = rz / 4096.0f;
-  return sqrtf(ax * ax + ay * ay + az * az) * 9.81f;
+    // ±2g clips at impact; ±8g needed per IEEE paper Section III-A
+    // Scale factor: 4096 LSB/g at ±8g sensitivity
+    float ax = rx / 4096.0f;
+    float ay = ry / 4096.0f;
+    float az = rz / 4096.0f;
+    mag = sqrtf(ax * ax + ay * ay + az * az) * 9.81f;
+    return true;
+  }
+  rx = 0; ry = 0; rz = 0;
+  mag = 0.0f;
+  return false;
+}
+
+float readRawMagnitude() {
+  int16_t rx, ry, rz;
+  float mag;
+  readIMU(rx, ry, rz, mag);
+  return mag;
 }
 
 // ============================================================================
@@ -203,7 +236,62 @@ float applySmoothing(float raw) {
 }
 
 float readSmoothed(float prevMag, unsigned long dt_us) {
-  float raw     = readRawMagnitude();
+  int16_t rx = 0, ry = 0, rz = 0;
+  float raw = 0.0f;
+  bool i2c_ok = readIMU(rx, ry, rz, raw);
+
+#if USE_INTEGRITY
+  // Per-sample validity v_k:
+  // i2c_ok AND mag >= 2.0 m/s^2 AND no axis >= 32700 LSB AND
+  // each axis changed > 2 LSB over last 25 samples AND measured_dt <= 40000 us
+  histX[axisHistHead] = rx;
+  histY[axisHistHead] = ry;
+  histZ[axisHistHead] = rz;
+  axisHistHead = (axisHistHead + 1) % AXIS_HIST_SIZE;
+  if (axisHistCount < AXIS_HIST_SIZE) axisHistCount++;
+
+  bool dynamic_ok = true;
+  if (axisHistCount >= AXIS_HIST_SIZE) {
+    int16_t minX = histX[0], maxX = histX[0];
+    int16_t minY = histY[0], maxY = histY[0];
+    int16_t minZ = histZ[0], maxZ = histZ[0];
+    for (int i = 1; i < AXIS_HIST_SIZE; i++) {
+      if (histX[i] < minX) minX = histX[i];
+      if (histX[i] > maxX) maxX = histX[i];
+      if (histY[i] < minY) minY = histY[i];
+      if (histY[i] > maxY) maxY = histY[i];
+      if (histZ[i] < minZ) minZ = histZ[i];
+      if (histZ[i] > maxZ) maxZ = histZ[i];
+    }
+    dynamic_ok = ((maxX - minX) > 2) && ((maxY - minY) > 2) && ((maxZ - minZ) > 2);
+  }
+
+  bool axis_limit_ok = (abs(rx) < 32700) && (abs(ry) < 32700) && (abs(rz) < 32700);
+  bool mag_ok        = (raw >= 2.0f);
+  bool dt_ok         = (dt_us <= 40000UL);
+
+  current_vk = (i2c_ok && mag_ok && axis_limit_ok && dynamic_ok && dt_ok) ? 1.0f : 0.0f;
+
+  // Quality index Q update: Q = 0.9 * Q + 0.1 * v_k
+  Q = 0.9f * Q + 0.1f * current_vk;
+
+  if (!sensorFault && Q < 0.5f) {
+    sensorFault = true;
+    faultStartTime = millis();
+    logEvent("SENSOR_FAULT,Q=" + String(Q, 2));
+    Serial.println("EVENT," + String(millis()) + ",SENSOR_FAULT," + String(Q, 2));
+    if (state == FREE_FALL || inFFDip) {
+      logEvent("POSSIBLE_FALL_DURING_FAULT");
+      Serial.println("EVENT," + String(millis()) + ",POSSIBLE_FALL_DURING_FAULT");
+    }
+  } else if (sensorFault && Q > 0.9f) {
+    sensorFault = false;
+    unsigned long recovery_ms = millis() - faultStartTime;
+    logEvent("SENSOR_RECOVERED,recovery_ms=" + String(recovery_ms));
+    Serial.println("EVENT," + String(millis()) + ",SENSOR_RECOVERED," + String(recovery_ms));
+  }
+#endif
+
   float smooth  = applySmoothing(raw);
   float dt_s    = (dt_us > 0) ? ((float)dt_us / 1000000.0f) : (SAMPLE_INTERVAL_MS / 1000.0f);
   liveJerk = fabsf(smooth - prevMag) / dt_s;
@@ -403,6 +491,9 @@ void resetToNormal(String reason) {
   calDoneBuzzerActive = false;
   inFFDip        = false;
   stillnessStart = 0;
+#if USE_INTEGRITY
+  stillnessAccumMs = 0;
+#endif
   state          = NORMAL;
   lastClassConf  = -1.0f;
   logEvent(reason);
@@ -528,6 +619,9 @@ void runFallDetection(unsigned long dt_us) {
         extractFeatures(lastFeatures); // Snapshot impact pulse immediately
         impactTime     = millis();
         stillnessStart = 0;
+#if USE_INTEGRITY
+        stillnessAccumMs = 0;
+#endif
         inFFDip        = false;
         state          = IMPACT;
       }
@@ -543,6 +637,9 @@ void runFallDetection(unsigned long dt_us) {
         extractFeatures(lastFeatures); // Snapshot impact pulse immediately
         impactTime     = millis();
         stillnessStart = 0;
+#if USE_INTEGRITY
+        stillnessAccumMs = 0;
+#endif
         inFFDip        = false;
         state          = IMPACT;
       } else if (millis() - ffStart >= FF_WINDOW_MS) {
@@ -562,6 +659,21 @@ void runFallDetection(unsigned long dt_us) {
       unsigned long timeSinceImpact = millis() - impactTime;
 
       // Independent Stillness Timer
+#if USE_INTEGRITY
+      unsigned long dt_ms = dt_us / 1000UL;
+      if (dt_ms == 0) dt_ms = SAMPLE_INTERVAL_MS;
+      if (current_vk > 0.5f && isStill) {
+        stillnessAccumMs += dt_ms;
+        if (stillnessAccumMs >= STILL_MS) {
+          lastClassConf = classify(lastFeatures); // Classify the snapshotted impact
+          state = CANDIDATE_FALL;
+          stillnessAccumMs = 0;
+          break;
+        }
+      } else if (!isStill) {
+        stillnessAccumMs = 0; // Reset stillness clock if moving
+      }
+#else
       if (isStill) {
         if (stillnessStart == 0) stillnessStart = millis();
         if (millis() - stillnessStart >= STILL_MS) {
@@ -572,6 +684,7 @@ void runFallDetection(unsigned long dt_us) {
       } else {
         stillnessStart = 0; // Reset stillness clock if moving
       }
+#endif
 
       // Movement Failsafe: if actively moving 5s after impact, reset to normal
       if (timeSinceImpact >= 5000 && !isStill) {
@@ -582,6 +695,13 @@ void runFallDetection(unsigned long dt_us) {
     }
 
     case CANDIDATE_FALL: {
+#if USE_INTEGRITY
+      if (sensorFault) {
+        // Suppress FALL_CONFIRMED during sensor fault
+        resetToNormal("SUPPRESSED_FAULT");
+        break;
+      }
+#endif
       if (lastClassConf >= theta) {
         state         = FALL_CONFIRMED;
         confirmedTime = millis();
@@ -598,6 +718,12 @@ void runFallDetection(unsigned long dt_us) {
     }
 
     case FALL_CONFIRMED: {
+#if USE_INTEGRITY
+      if (sensorFault) {
+        // Suppress ALERT_SENT during sensor fault
+        break;
+      }
+#endif
       playPattern(PAT_CANCEL, PAT_CANCEL_N);
       if (quickPress) {
         updateClassStats(nonFallStats, lastFeatures);
@@ -921,6 +1047,16 @@ void setup() {
   Wire.endTransmission(true);
   Serial.println("MPU6050 configured to ±8g range (scale factor 4096 LSB/g).");
 
+#if USE_INTEGRITY
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x75); // WHO_AM_I register
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 1, true);
+  uint8_t whoami = Wire.available() ? Wire.read() : 0;
+  Serial.print("MPU6050 WHO_AM_I (0x75): 0x");
+  Serial.println(whoami, HEX);
+#endif
+
 #if USE_WIFI
   Serial.print("Connecting to WiFi");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -964,6 +1100,12 @@ void loop() {
     lastSampleUs = now_us;
     runFallDetection(dt_us);
   }
+
+#if USE_INTEGRITY
+  if (sensorFault) {
+    playPattern(PAT_FAULT, PAT_FAULT_N);
+  }
+#endif
 
   if (calDoneBuzzerActive) {
     if (millis() - calDoneBuzzerStart < CAL_DONE_BUZZER_DURATION) {
