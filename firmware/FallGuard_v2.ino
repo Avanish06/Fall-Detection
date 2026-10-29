@@ -139,7 +139,8 @@ float actMeanMag  = 9.81f;
 float actM2Mag    = 0.0f;
 float actVarMag   = 0.0f;
 
-// --- Online Gaussian Naive Bayes classifier ---
+// --- Online Gaussian Naive Bayes classifier (USE_GNB) ---
+#if USE_GNB
 const int N_FEATURES = 6;
 
 struct ClassStats {
@@ -154,6 +155,7 @@ ClassStats nonFallStats;
 
 float lastClassConf = -1.0f;
 float lastFeatures[N_FEATURES];
+#endif
 
 // --- Event log ---
 String eventLog[LOG_SIZE];
@@ -318,9 +320,10 @@ float getRecentMaxJerk(unsigned long ms) {
 }
 
 // ============================================================================
-//  FEATURE LAYER
+//  FEATURE LAYER & ONLINE GAUSSIAN NAIVE BAYES (USE_GNB)
 // ============================================================================
 
+#if USE_GNB
 void extractFeatures(float feats[N_FEATURES]) {
   int n = winFull ? WINDOW_SIZE : winHead;
   if (n < 2) { for (int i = 0; i < N_FEATURES; i++) feats[i] = 0; return; }
@@ -348,10 +351,6 @@ void extractFeatures(float feats[N_FEATURES]) {
   feats[4] = mx / fmaxf(mn, 0.1f);
   feats[5] = mxJ;
 }
-
-// ============================================================================
-//  ONLINE GAUSSIAN NAIVE BAYES
-// ============================================================================
 
 void initClassStats(ClassStats& cs) {
   cs.count = 0;
@@ -397,6 +396,7 @@ float classify(float feats[N_FEATURES]) {
   float expNF   = expf(logNonFall - maxL);
   return expFall / (expFall + expNF + 1e-9f);
 }
+#endif // USE_GNB
 
 // ============================================================================
 //  ACTIVITY INFERENCE
@@ -495,7 +495,9 @@ void resetToNormal(String reason) {
   stillnessAccumMs = 0;
 #endif
   state          = NORMAL;
+#if USE_GNB
   lastClassConf  = -1.0f;
+#endif
   logEvent(reason);
 }
 
@@ -516,6 +518,17 @@ void processSerialCommand(String cmd) {
     theta = constrain(v, THETA_MIN, THETA_MAX);
     logEvent("THETA_SET_SERIAL=" + String(theta, 2));
   }
+#if USE_GNB
+  else if (cmd == "TRAIN,FALL") {
+    updateClassStats(fallStats, lastFeatures);
+    logEvent("TRAINED_FALL,count=" + String(fallStats.count));
+    Serial.println("EVENT," + String(millis()) + ",TRAINED_FALL," + String(fallStats.count));
+  } else if (cmd == "TRAIN,NONFALL") {
+    updateClassStats(nonFallStats, lastFeatures);
+    logEvent("TRAINED_NONFALL,count=" + String(nonFallStats.count));
+    Serial.println("EVENT," + String(millis()) + ",TRAINED_NONFALL," + String(nonFallStats.count));
+  }
+#endif
 }
 
 void checkSerialCommands() {
@@ -553,11 +566,10 @@ void runFallDetection(unsigned long dt_us) {
   if (remoteCancelReq) {
     remoteCancelReq = false;
     if (state != NORMAL && state != CALIBRATING) {
-      if (lastClassConf >= 0 || state == IMPACT) {
-        updateClassStats(nonFallStats, lastFeatures);
-        theta = fminf(THETA_MAX, theta + THETA_UP);
-        logEvent("CANCEL_REMOTE theta=" + String(theta, 2));
-      }
+#if USE_GNB
+      theta = fminf(THETA_MAX, theta + THETA_UP);
+      logEvent("CANCEL_REMOTE theta=" + String(theta, 2));
+#endif
       resetToNormal("CANCEL_REMOTE");
     }
   }
@@ -568,11 +580,21 @@ void runFallDetection(unsigned long dt_us) {
   Serial.print(liveMag,  2); Serial.print(",");
   Serial.print(jerk,     1); Serial.print(",");
   Serial.print(stateStr());   Serial.print(",");
+#if USE_GNB
   Serial.print(lastClassConf >= 0 ? lastClassConf : 0.0f, 3); Serial.print(",");
+#else
+  Serial.print(0.0f, 3); Serial.print(",");
+#endif
   Serial.print(activityName()); Serial.print(",");
+#if USE_GNB
   Serial.print(fallStats.count); Serial.print(",");
   Serial.print(nonFallStats.count); Serial.print(",");
   Serial.print(theta, 3); Serial.print(",");
+#else
+  Serial.print(0); Serial.print(",");
+  Serial.print(0); Serial.print(",");
+  Serial.print(0.65f, 3); Serial.print(",");
+#endif
   Serial.print(IMPACT_THRESHOLD, 1); Serial.print(",");
   Serial.println(JERK_THRESHOLD, 1);
 
@@ -616,7 +638,9 @@ void runFallDetection(unsigned long dt_us) {
       // Path 2: Direct High-Jerk Trigger (for sudden slips/trips without sustained zero-g dip)
 #if USE_PATH2
       if (jerk >= JERK_PATH2 && liveMag >= MAG_PATH2) {
+#if USE_GNB
         extractFeatures(lastFeatures); // Snapshot impact pulse immediately
+#endif
         impactTime     = millis();
         stillnessStart = 0;
 #if USE_INTEGRITY
@@ -634,7 +658,9 @@ void runFallDetection(unsigned long dt_us) {
       float recentMaxJerk = getRecentMaxJerk(150);
 
       if (liveMag >= IMPACT_THRESHOLD && (jerk >= JERK_THRESHOLD || recentMaxJerk >= JERK_THRESHOLD)) {
+#if USE_GNB
         extractFeatures(lastFeatures); // Snapshot impact pulse immediately
+#endif
         impactTime     = millis();
         stillnessStart = 0;
 #if USE_INTEGRITY
@@ -650,8 +676,9 @@ void runFallDetection(unsigned long dt_us) {
 
     case IMPACT: {
       if (quickPress) {
-        updateClassStats(nonFallStats, lastFeatures);
+#if USE_GNB
         theta = fminf(THETA_MAX, theta + THETA_UP);
+#endif
         resetToNormal("CANCEL_USER_IMPACT");
         break;
       }
@@ -665,8 +692,15 @@ void runFallDetection(unsigned long dt_us) {
       if (current_vk > 0.5f && isStill) {
         stillnessAccumMs += dt_ms;
         if (stillnessAccumMs >= STILL_MS) {
+#if USE_GNB
           lastClassConf = classify(lastFeatures); // Classify the snapshotted impact
           state = CANDIDATE_FALL;
+#else
+          state = FALL_CONFIRMED;
+          confirmedTime = millis();
+          logEvent("FALL_CONFIRMED,rule_engine_only");
+          Serial.println("EVENT," + String(millis()) + ",FALL_CONFIRMED,1.000");
+#endif
           stillnessAccumMs = 0;
           break;
         }
@@ -677,8 +711,15 @@ void runFallDetection(unsigned long dt_us) {
       if (isStill) {
         if (stillnessStart == 0) stillnessStart = millis();
         if (millis() - stillnessStart >= STILL_MS) {
+#if USE_GNB
           lastClassConf = classify(lastFeatures); // Classify the snapshotted impact
           state = CANDIDATE_FALL;
+#else
+          state = FALL_CONFIRMED;
+          confirmedTime = millis();
+          logEvent("FALL_CONFIRMED,rule_engine_only");
+          Serial.println("EVENT," + String(millis()) + ",FALL_CONFIRMED,1.000");
+#endif
           break;
         }
       } else {
@@ -688,13 +729,13 @@ void runFallDetection(unsigned long dt_us) {
 
       // Movement Failsafe: if actively moving 5s after impact, reset to normal
       if (timeSinceImpact >= 5000 && !isStill) {
-        updateClassStats(nonFallStats, lastFeatures);
         resetToNormal("IMPACT_TIMEOUT_MOVING");
       }
       break;
     }
 
     case CANDIDATE_FALL: {
+#if USE_GNB
 #if USE_INTEGRITY
       if (sensorFault) {
         // Suppress FALL_CONFIRMED during sensor fault
@@ -702,18 +743,23 @@ void runFallDetection(unsigned long dt_us) {
         break;
       }
 #endif
-      if (lastClassConf >= theta) {
+      bool classifierTrained = (fallStats.count >= 3 && nonFallStats.count >= 3);
+      if (!classifierTrained || lastClassConf >= theta) {
         state         = FALL_CONFIRMED;
         confirmedTime = millis();
         logEvent("FALL_CONFIRMED,conf=" + String(lastClassConf, 3) +
-                 ",theta=" + String(theta, 2));
+                 ",theta=" + String(theta, 2) +
+                 (classifierTrained ? "" : ",untrained=1"));
         Serial.println("EVENT," + String(millis()) +
                        ",FALL_CONFIRMED," + String(lastClassConf, 3));
       } else {
-        updateClassStats(nonFallStats, lastFeatures);
         theta = fminf(THETA_MAX, theta + THETA_UP * 0.5f);
         resetToNormal("CLASSIFIER_REJECTED,conf=" + String(lastClassConf, 3));
       }
+#else
+      state = FALL_CONFIRMED;
+      confirmedTime = millis();
+#endif
       break;
     }
 
@@ -726,19 +772,25 @@ void runFallDetection(unsigned long dt_us) {
 #endif
       playPattern(PAT_CANCEL, PAT_CANCEL_N);
       if (quickPress) {
-        updateClassStats(nonFallStats, lastFeatures);
+#if USE_GNB
         theta = fminf(THETA_MAX, theta + THETA_UP);
         logEvent("CANCEL_USER,theta=" + String(theta, 2));
+#else
+        logEvent("CANCEL_USER");
+#endif
         resetToNormal("CANCEL_USER");
         break;
       }
       if (millis() - confirmedTime >= CANCEL_MS) {
         state = ALERT_SENT;
-        updateClassStats(fallStats, lastFeatures);
+#if USE_GNB
         theta = fmaxf(THETA_MIN, theta - THETA_DOWN);
         logEvent("ALERT_SENT,theta=" + String(theta, 2) +
                  ",fallCount=" + String(fallStats.count) +
                  ",nonFallCount=" + String(nonFallStats.count));
+#else
+        logEvent("ALERT_SENT");
+#endif
         Serial.println("EVENT," + String(millis()) + ",ALERT_SENT");
       }
       break;
@@ -976,11 +1028,18 @@ void handleData() {
   json += "\"state\":\"" + stateStr() + "\",";
   json += "\"mag\":"      + String(liveMag,       2) + ",";
   json += "\"jerk\":"     + String(liveJerk,      1) + ",";
+#if USE_GNB
   json += "\"conf\":"     + String(lastClassConf, 3) + ",";
-  json += "\"activity\":\"" + activityName() + "\",";
   json += "\"fallCount\":"   + String(fallStats.count)    + ",";
   json += "\"nonFallCount\":" + String(nonFallStats.count) + ",";
   json += "\"theta\":"       + String(theta,         3) + ",";
+#else
+  json += "\"conf\":0.0,";
+  json += "\"fallCount\":0,";
+  json += "\"nonFallCount\":0,";
+  json += "\"theta\":0.65,";
+#endif
+  json += "\"activity\":\"" + activityName() + "\",";
   json += "\"impThresh\":"   + String(IMPACT_THRESHOLD, 1) + ",";
   json += "\"jerkThresh\":"  + String(JERK_THRESHOLD,   1) + ",";
   json += "\"log\":"         + evJSON;
@@ -1029,8 +1088,10 @@ void setup() {
 
   for (int i = 0; i < LOG_SIZE; i++) eventLog[i] = "";
 
+#if USE_GNB
   initClassStats(fallStats);
   initClassStats(nonFallStats);
+#endif
 
   // MPU6050 wake up (register 0x6B = 0)
   Wire.begin(21, 22);
