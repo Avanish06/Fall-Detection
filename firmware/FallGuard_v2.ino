@@ -15,59 +15,80 @@
   ============================================================
 */
 
-#include <WiFi.h>
-#include <WebServer.h>
 #include <Wire.h>
 #include <math.h>
 
-// --- WiFi credentials ------------------------------------------------------
-const char* WIFI_SSID     = "PingNaMileDubara";
-const char* WIFI_PASSWORD = "123avanish";
+// ============================================================================
+//  CONFIGURATION & COMPILE-TIME FEATURE FLAGS
+// ============================================================================
 
-// --- Pin assignments --------------------------------------------------------
-const int MPU_ADDR   = 0x68;
-const int BUZZER_PIN = 5;
-const int BUTTON_PIN = 2;
+// --- Compile-Time Feature Flags ---
+#define USE_WIFI       1
+#define USE_GNB        1
+#define USE_INTEGRITY  1
+#define USE_ADAPTIVE   1
+#define USE_STILLNESS  1
+#define USE_PATH2      1
 
-// --- Sampling ---------------------------------------------------------------
-const int    SAMPLE_RATE_HZ      = 50;               // Hz
-const int    SAMPLE_INTERVAL_MS  = 1000 / SAMPLE_RATE_HZ; // 20 ms
-const int    WINDOW_SIZE         = 25;               // 500 ms window
+// --- WiFi Configuration ---
+#if USE_WIFI
+#include <WiFi.h>
+#include <WebServer.h>
+#include "secrets.h"
+#endif
 
-// --- SMA filter -------------------------------------------------------------
-const int    SMA_SIZE            = 5;
+// --- Phase timings & thresholds ---
+const float         FREE_FALL_MAG       = 5.0f;    // m/s^2 - downward acceleration dip
+const unsigned long FF_MIN_MS           = 40;      // free-fall must last 40ms (2 samples)
+const unsigned long FF_WINDOW_MS        = 1400;    // impact must follow within this window
 
-// --- Phase timings ----------------------------------------------------------
-const float  FREE_FALL_MAG       = 5.0f;   // m/s^2 - downward acceleration dip
-const unsigned long FF_MIN_MS    = 40;     // free-fall must last 40ms (2 samples)
-const unsigned long FF_WINDOW_MS = 1400;   // impact must follow within this window
+const float         STILL_LOW           = 7.5f;    // m/s^2 - stillness band lower bound
+const float         STILL_HIGH          = 12.0f;   // m/s^2 - stillness band upper bound
+const unsigned long STILL_MS            = 2200;    // stillness duration baseline
 
-const float  STILL_LOW           = 7.5f;   // m/s^2 - stillness band
-const float  STILL_HIGH          = 12.0f;
-const unsigned long STILL_MS     = 2200;   // must stay still 2.2s (raised from 1800 to reject jumps/stumbles)
+const unsigned long CANCEL_MS           = 5000;    // user cancel window after confirm
 
-const unsigned long CANCEL_MS    = 5000;   // user cancel window after confirm
+float               JERK_THRESHOLD      = 220.0f;  // jerk threshold (m/s^3 at 50 Hz)
+float               IMPACT_THRESHOLD    = 11.5f;   // personal impact threshold (m/s^2)
 
-// --- Jerk threshold (m/s^3 at 50 Hz) ----------------------------------------
-float JERK_THRESHOLD   = 220.0f;
+const float         JERK_PATH2          = 280.0f;  // Path 2 direct high-jerk trigger (m/s^3)
+const float         MAG_PATH2           = 11.5f;   // Path 2 direct impact magnitude (m/s^2)
 
-// --- Personal impact threshold (m/s^2) --------------------------------------
-float IMPACT_THRESHOLD = 11.5f;
+// --- Sampling ---
+const int           SAMPLE_RATE_HZ      = 50;               // Hz
+const int           SAMPLE_INTERVAL_MS  = 1000 / SAMPLE_RATE_HZ; // 20 ms
+const int           WINDOW_SIZE         = 25;               // 500 ms window
+const int           SMA_SIZE            = 5;
 
-// --- Adaptive confidence threshold theta ------------------------------------
-float theta = 0.65f;
-const float THETA_MAX  = 0.85f;
-const float THETA_MIN  = 0.50f;
-const float THETA_UP   = 0.02f;
-const float THETA_DOWN = 0.01f;
+// --- Hardware Pins ---
+const int           MPU_ADDR            = 0x68;
+const int           BUZZER_PIN          = 5;
+const int           BUTTON_PIN          = 2;
 
-// --- Calibration ------------------------------------------------------------
-const unsigned long CAL_DURATION_MS = 20000; // 20 s
+// --- Adaptive Confidence Threshold theta ---
+float               theta               = 0.65f;
+const float         THETA_MAX           = 0.85f;
+const float         THETA_MIN           = 0.50f;
+const float         THETA_UP            = 0.02f;
+const float         THETA_DOWN          = 0.01f;
+
+// --- Calibration Timing & Button ---
+const unsigned long CAL_DURATION_MS     = 20000;  // 20 s
+const unsigned long DEBOUNCE_MS         = 50;
+const unsigned long HOLD_PRESS_MS       = 1500;
+const int           LOG_SIZE            = 12;
+
+// ============================================================================
+//  GLOBAL STATE & BUFFERS
+// ============================================================================
+
 float calMaxMag  = 0.0f;
 float calMaxJerk = 0.0f;
 unsigned long calStart = 0;
+bool calDoneBuzzerActive = false;
+unsigned long calDoneBuzzerStart = 0;
+const unsigned long CAL_DONE_BUZZER_DURATION = 740; // 80+80+80+500 ms
 
-// --- State machine ----------------------------------------------------------
 enum FallState {
   CALIBRATING,
   NORMAL,
@@ -79,18 +100,18 @@ enum FallState {
 };
 FallState state = CALIBRATING;
 
-// --- Sliding window ---------------------------------------------------------
+// --- Sliding window ---
 float winMag[WINDOW_SIZE];
 float winJerk[WINDOW_SIZE];
 int   winHead    = 0;
 bool  winFull    = false;
 
-// --- SMA filter ring buffer --------------------------------------------------
+// --- SMA filter ring buffer ---
 float smaBuffer[SMA_SIZE];
 int   smaHead    = 0;
 float smaSum     = 0.0f;
 
-// --- Activity inference -----------------------------------------------------
+// --- Activity inference ---
 enum Activity { ACT_STILL, ACT_WALKING, ACT_RUNNING };
 Activity currentActivity = ACT_STILL;
 
@@ -99,7 +120,7 @@ float actMeanMag  = 9.81f;
 float actM2Mag    = 0.0f;
 float actVarMag   = 0.0f;
 
-// --- Online Gaussian Naive Bayes classifier ---------------------------------
+// --- Online Gaussian Naive Bayes classifier ---
 const int N_FEATURES = 6;
 
 struct ClassStats {
@@ -115,35 +136,35 @@ ClassStats nonFallStats;
 float lastClassConf = -1.0f;
 float lastFeatures[N_FEATURES];
 
-// --- Event log --------------------------------------------------------------
-const int LOG_SIZE = 12;
+// --- Event log ---
 String eventLog[LOG_SIZE];
 int    logHead = 0;
 
-// --- Timing bookmarks -------------------------------------------------------
+// --- Timing bookmarks ---
 unsigned long ffStart        = 0;
 unsigned long impactTime     = 0;
 unsigned long stillnessStart = 0;
 unsigned long confirmedTime  = 0;
-unsigned long lastSampleMs   = 0;
+unsigned long lastSampleUs   = 0;
 
 bool inFFDip = false;
 
-// --- Button state -----------------------------------------------------------
+// --- Button state ---
 bool lastRaw = HIGH, debounced = HIGH;
 unsigned long debounceTs = 0;
 unsigned long pressStart = 0;
 bool holdTriggered  = false;
 bool quickPress     = false;
 bool holdPress      = false;
-const unsigned long DEBOUNCE_MS   = 50;
-const unsigned long HOLD_PRESS_MS = 1500;
 
-// --- Remote cancel ----------------------------------------------------------
+// --- Remote cancel & non-blocking Serial command buffer ---
 volatile bool remoteCancelReq = false;
+String serialRxBuf = "";
 
-// --- Web server -------------------------------------------------------------
+// --- Web server ---
+#if USE_WIFI
 WebServer server(80);
+#endif
 
 float liveMag  = 9.81f;
 float liveJerk = 0.0f;
@@ -160,9 +181,12 @@ float readRawMagnitude() {
   int16_t rx = (int16_t)(Wire.read() << 8 | Wire.read());
   int16_t ry = (int16_t)(Wire.read() << 8 | Wire.read());
   int16_t rz = (int16_t)(Wire.read() << 8 | Wire.read());
-  float ax = rx / 16384.0f;
-  float ay = ry / 16384.0f;
-  float az = rz / 16384.0f;
+
+  // ±2g clips at impact; ±8g needed per IEEE paper Section III-A
+  // Scale factor: 4096 LSB/g at ±8g sensitivity
+  float ax = rx / 4096.0f;
+  float ay = ry / 4096.0f;
+  float az = rz / 4096.0f;
   return sqrtf(ax * ax + ay * ay + az * az) * 9.81f;
 }
 
@@ -178,10 +202,11 @@ float applySmoothing(float raw) {
   return smaSum / SMA_SIZE;
 }
 
-float readSmoothed(float prevMag) {
+float readSmoothed(float prevMag, unsigned long dt_us) {
   float raw     = readRawMagnitude();
   float smooth  = applySmoothing(raw);
-  liveJerk = fabsf(smooth - prevMag) / (SAMPLE_INTERVAL_MS / 1000.0f);
+  float dt_s    = (dt_us > 0) ? ((float)dt_us / 1000000.0f) : (SAMPLE_INTERVAL_MS / 1000.0f);
+  liveJerk = fabsf(smooth - prevMag) / dt_s;
   return smooth;
 }
 
@@ -375,6 +400,7 @@ void readButton() {
 
 void resetToNormal(String reason) {
   buzzerOff();
+  calDoneBuzzerActive = false;
   inFFDip        = false;
   stillnessStart = 0;
   state          = NORMAL;
@@ -383,12 +409,47 @@ void resetToNormal(String reason) {
 }
 
 // ============================================================================
+//  NON-BLOCKING SERIAL COMMAND HANDLER
+// ============================================================================
+
+void processSerialCommand(String cmd) {
+  cmd.trim();
+  if (cmd == "CANCEL") {
+    remoteCancelReq = true;
+  } else if (cmd == "ACK") {
+    if (state == ALERT_SENT) {
+      resetToNormal("ALERT_ACKNOWLEDGED_SERIAL");
+    }
+  } else if (cmd.startsWith("SET_THETA ")) {
+    float v = cmd.substring(10).toFloat();
+    theta = constrain(v, THETA_MIN, THETA_MAX);
+    logEvent("THETA_SET_SERIAL=" + String(theta, 2));
+  }
+}
+
+void checkSerialCommands() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serialRxBuf.length() > 0) {
+        processSerialCommand(serialRxBuf);
+        serialRxBuf = "";
+      }
+    } else {
+      if (serialRxBuf.length() < 64) {
+        serialRxBuf += c;
+      }
+    }
+  }
+}
+
+// ============================================================================
 //  MAIN STATE MACHINE
 // ============================================================================
 
-void runFallDetection() {
+void runFallDetection(unsigned long dt_us) {
   float prevMag = liveMag;
-  liveMag  = readSmoothed(prevMag);
+  liveMag  = readSmoothed(prevMag, dt_us);
   float jerk = liveJerk;
   pushWindow(liveMag, jerk);
 
@@ -397,23 +458,6 @@ void runFallDetection() {
   }
 
   readButton();
-
-  // Read USB Serial commands from dashboard
-  while (Serial.available() > 0) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    if (cmd == "CANCEL") {
-      remoteCancelReq = true;
-    } else if (cmd == "ACK") {
-      if (state == ALERT_SENT) {
-        resetToNormal("ALERT_ACKNOWLEDGED_SERIAL");
-      }
-    } else if (cmd.startsWith("SET_THETA ")) {
-      float v = cmd.substring(10).toFloat();
-      theta = constrain(v, THETA_MIN, THETA_MAX);
-      logEvent("THETA_SET_SERIAL=" + String(theta, 2));
-    }
-  }
 
   if (remoteCancelReq) {
     remoteCancelReq = false;
@@ -453,11 +497,8 @@ void runFallDetection() {
         IMPACT_THRESHOLD = constrain(calMaxMag  * 1.15f, 11.0f, 13.0f);
         JERK_THRESHOLD   = constrain(calMaxJerk * 1.15f, 180.0f, 260.0f);
         state = NORMAL;
-        for (int i = 0; i < PAT_CAL_N; i++) {
-          digitalWrite(BUZZER_PIN, (i % 2 == 0) ? HIGH : LOW);
-          delay(PAT_CAL[i]);
-        }
-        buzzerOff();
+        calDoneBuzzerActive = true;
+        calDoneBuzzerStart  = millis();
         logEvent("CALIBRATION_DONE,impactThresh=" + String(IMPACT_THRESHOLD, 1) +
                  ",jerkThresh=" + String(JERK_THRESHOLD, 1));
         Serial.println("EVENT," + String(millis()) +
@@ -482,13 +523,15 @@ void runFallDetection() {
       }
 
       // Path 2: Direct High-Jerk Trigger (for sudden slips/trips without sustained zero-g dip)
-      if (jerk >= 280.0f && liveMag >= 11.5f) {
+#if USE_PATH2
+      if (jerk >= JERK_PATH2 && liveMag >= MAG_PATH2) {
         extractFeatures(lastFeatures); // Snapshot impact pulse immediately
         impactTime     = millis();
         stillnessStart = 0;
         inFFDip        = false;
         state          = IMPACT;
       }
+#endif
       break;
     }
 
@@ -614,6 +657,7 @@ String buildEventLogJSON() {
   return out;
 }
 
+#if USE_WIFI
 const char DASHBOARD[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -838,6 +882,7 @@ void handleSetTheta() {
   }
   server.send(200, "text/plain", "OK");
 }
+#endif // USE_WIFI
 
 // ============================================================================
 //  SETUP
@@ -861,12 +906,22 @@ void setup() {
   initClassStats(fallStats);
   initClassStats(nonFallStats);
 
+  // MPU6050 wake up (register 0x6B = 0)
   Wire.begin(21, 22);
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x6B);
   Wire.write(0x00);
   Wire.endTransmission(true);
 
+  // ±2g clips at impact; ±8g needed per IEEE paper Section III-A
+  // Register 0x1C = 0x10 sets full-scale range to ±8g (AFS_SEL=2, 4096 LSB/g)
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1C);
+  Wire.write(0x10);
+  Wire.endTransmission(true);
+  Serial.println("MPU6050 configured to ±8g range (scale factor 4096 LSB/g).");
+
+#if USE_WIFI
   Serial.print("Connecting to WiFi");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   int tries = 0;
@@ -885,6 +940,9 @@ void setup() {
   server.on("/ack",      handleAck);
   server.on("/setTheta", handleSetTheta);
   server.begin();
+#else
+  Serial.println("WiFi disabled by configuration (USE_WIFI=0).");
+#endif
 
   calStart = millis();
   state    = CALIBRATING;
@@ -898,10 +956,25 @@ void setup() {
 // ============================================================================
 
 void loop() {
-  unsigned long now = millis();
-  if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {
-    lastSampleMs = now;
-    runFallDetection();
+  checkSerialCommands();
+
+  unsigned long now_us = micros();
+  if (now_us - lastSampleUs >= (unsigned long)SAMPLE_INTERVAL_MS * 1000UL) {
+    unsigned long dt_us = (lastSampleUs == 0) ? (SAMPLE_INTERVAL_MS * 1000UL) : (now_us - lastSampleUs);
+    lastSampleUs = now_us;
+    runFallDetection(dt_us);
   }
+
+  if (calDoneBuzzerActive) {
+    if (millis() - calDoneBuzzerStart < CAL_DONE_BUZZER_DURATION) {
+      playPattern(PAT_CAL, PAT_CAL_N);
+    } else {
+      buzzerOff();
+      calDoneBuzzerActive = false;
+    }
+  }
+
+#if USE_WIFI
   server.handleClient();
+#endif
 }

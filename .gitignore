@@ -6,6 +6,9 @@ __pycache__/
 venv/
 .venv/
 
+# Secrets
+secrets.h
+
 # Results / data (add your own CSVs manually)
 results/*.csv
 results/*.png
