@@ -1889,6 +1889,7 @@ def main():
     global is_replay_mode, active_port_name, pilot_dir, stop_threads
 
     parser = argparse.ArgumentParser(description="FallGuard v2 Offline USB Lab Dashboard")
+    parser.add_argument("pos_port", nargs="?", default=None, help="Optional positional serial port (e.g. COM6)")
     parser.add_argument("--port", "-p", type=str, default="AUTO", help="USB Serial port (e.g. COM6 or AUTO)")
     parser.add_argument("--web-port", "-w", type=int, default=DEFAULT_PORT, help="Local HTTP server port (default: 5000)")
     parser.add_argument("--replay", type=str, default=None, help="Replay prerecorded telemetry CSV (MOCK ONLY — NOT LIVE)")
@@ -1898,7 +1899,7 @@ def main():
     # Step 1: Strict Offline Compliance Verification
     verify_offline_compliance(DASHBOARD_HTML)
 
-    active_port_name = args.port
+    active_port_name = args.pos_port if args.pos_port is not None else args.port
 
     # Step 2: Serial / Replay Thread Launch
     if args.replay:
