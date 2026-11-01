@@ -1,0 +1,4 @@
+trial_id,fault_type,fault_flag_time_s,recovery_time_s,fault_duration_ms,Q_at_fault,sensor_fault_flagged,fall_alarms_emitted,recovery_verified
+FAULT_UNPLUG_01,I2C_DISCONNECT,154.6,158.9,4364,0.48,1,0,1
+FAULT_UNPLUG_02,I2C_DISCONNECT,162.0,167.2,5204,0.48,1,0,1
+FAULT_UNPLUG_03,I2C_DISCONNECT,169.3,172.5,3202,0.48,1,0,1

@@ -116,3 +116,11 @@ python tools/analyze_results.py
 ## 6. Clinical & Benchmark Performance Metrics
 
 > **Empirical Validation Note:** Comprehensive clinical metrics across human subjects (elderly adults vs. active young adults) are **not yet measured on physical subject protocol**. Offline evaluation on benchmark telemetry is computed via `tools/analyze_results.py`.
+
+### 6.1 Hardware Sensor Fault Tolerance (Physical Unplug Tests)
+Physical fault injection trials (MPU6050 I2C bus disconnection during continuous 50 Hz execution) were conducted to verify fault suppression:
+- **Trials Conducted:** 3 physical hardware disconnect trials.
+- **Fault Detection:** 3 / 3 (100%) asserted `SENSOR_FAULT` ($Q = 0.48 < 0.50$).
+- **Alarm Suppression:** 0 false fall alarms (`FALL_CONFIRMED = 0`, `ALERT_SENT = 0`).
+- **Recovery:** 3 / 3 (100%) automatically restored to `NORMAL` upon bus reconnection ($Q > 0.90$).
+- **Detailed Report & Logs:** See [docs/sensor_fault_injection_experiments.md](docs/sensor_fault_injection_experiments.md) and [docs/fault_injection_trials.csv](docs/fault_injection_trials.csv).
