@@ -118,6 +118,12 @@ float Q = 1.0f;
 bool  sensorFault = false;
 unsigned long faultStartTime = 0;
 unsigned long stillnessAccumMs = 0;
+bool validCandidateActive = false;
+
+// Metrics independent of unplug duration
+int badSampleStreak = 0;
+int faultDetectSamples = 0;
+unsigned long firstGoodSampleTime = 0;
 
 const int AXIS_HIST_SIZE = 25;
 int16_t histX[AXIS_HIST_SIZE];
@@ -286,23 +292,63 @@ float readSmoothed(float prevMag, unsigned long dt_us) {
 
   current_vk = (i2c_ok && mag_ok && axis_limit_ok && dynamic_ok && dt_ok) ? 1.0f : 0.0f;
 
+  if (!sensorFault) {
+    if (current_vk < 0.5f) {
+      badSampleStreak++;
+    } else {
+      badSampleStreak = 0;
+    }
+  } else {
+    // While in sensorFault: track arrival of the first good sample after replug
+    if (current_vk > 0.5f) {
+      if (firstGoodSampleTime == 0) {
+        firstGoodSampleTime = millis();
+      }
+    } else {
+      firstGoodSampleTime = 0; // Reset if intermittent glitches occur before stable connection
+    }
+  }
+
   // Quality index Q update: Q = 0.9 * Q + 0.1 * v_k
   Q = 0.9f * Q + 0.1f * current_vk;
 
   if (!sensorFault && Q < 0.5f) {
     sensorFault = true;
     faultStartTime = millis();
-    logEvent("SENSOR_FAULT,Q=" + String(Q, 2));
-    Serial.println("EVENT," + String(millis()) + ",SENSOR_FAULT," + String(Q, 2));
-    if (state == FREE_FALL || inFFDip) {
+    faultDetectSamples = badSampleStreak;
+    firstGoodSampleTime = 0;
+
+    logEvent("SENSOR_FAULT,Q=" + String(Q, 2) + ",fault_detect_samples=" + String(faultDetectSamples));
+    Serial.println("EVENT," + String(millis()) + ",SENSOR_FAULT," + String(Q, 2) + "," + String(faultDetectSamples));
+
+    // Only log POSSIBLE_FALL_DURING_FAULT if candidate was started from VALID samples before fault
+    if (validCandidateActive && (state == FREE_FALL || state == IMPACT || state == CANDIDATE_FALL || inFFDip)) {
       logEvent("POSSIBLE_FALL_DURING_FAULT");
       Serial.println("EVENT," + String(millis()) + ",POSSIBLE_FALL_DURING_FAULT");
     }
+
+    // Reset free-fall/impact candidate to NORMAL on entering SENSOR_FAULT
+    if (state == FREE_FALL || state == IMPACT || state == CANDIDATE_FALL) {
+      state = NORMAL;
+    }
+    inFFDip = false;
+    validCandidateActive = false;
+
   } else if (sensorFault && Q > 0.9f) {
     sensorFault = false;
-    unsigned long recovery_ms = millis() - faultStartTime;
-    logEvent("SENSOR_RECOVERED,recovery_ms=" + String(recovery_ms));
-    Serial.println("EVENT," + String(millis()) + ",SENSOR_RECOVERED," + String(recovery_ms));
+    unsigned long fault_duration_ms = millis() - faultStartTime;
+    unsigned long recover_ms_after_good = (firstGoodSampleTime > 0) ? (millis() - firstGoodSampleTime) : 0;
+    badSampleStreak = 0;
+
+    logEvent("SENSOR_RECOVERED,fault_duration_ms=" + String(fault_duration_ms) + ",recover_ms_after_good=" + String(recover_ms_after_good));
+    Serial.println("EVENT," + String(millis()) + ",SENSOR_RECOVERED," + String(fault_duration_ms) + "," + String(recover_ms_after_good));
+
+    // Reset free-fall/impact candidate to NORMAL on SENSOR_RECOVERED
+    if (state == FREE_FALL || state == IMPACT || state == CANDIDATE_FALL) {
+      state = NORMAL;
+    }
+    inFFDip = false;
+    validCandidateActive = false;
   }
 #endif
 
@@ -507,6 +553,7 @@ void resetToNormal(String reason) {
   J_peak         = 0.0f;
 #if USE_INTEGRITY
   stillnessAccumMs = 0;
+  validCandidateActive = false;
 #endif
   state          = NORMAL;
 #if USE_GNB
@@ -642,6 +689,13 @@ void runFallDetection(unsigned long dt_us) {
   Serial.println("OK");
 #endif
 
+#if USE_INTEGRITY
+  // Requirement 1: Do not feed invalid samples (v_k = 0) to state machine. Hold state instead.
+  if (current_vk < 0.5f || sensorFault) {
+    return;
+  }
+#endif
+
   bool isStill = (liveMag >= STILL_LOW && liveMag <= STILL_HIGH);
 
   switch (state) {
@@ -674,6 +728,9 @@ void runFallDetection(unsigned long dt_us) {
         if (!inFFDip) { inFFDip = true; ffStart = millis(); }
         if (millis() - ffStart >= FF_MIN_MS) {
           state = FREE_FALL;
+#if USE_INTEGRITY
+          validCandidateActive = true;
+#endif
         }
       } else {
         inFFDip = false;
@@ -691,6 +748,7 @@ void runFallDetection(unsigned long dt_us) {
         stillnessStart = 0;
 #if USE_INTEGRITY
         stillnessAccumMs = 0;
+        validCandidateActive = true;
 #endif
         inFFDip        = false;
         state          = IMPACT;

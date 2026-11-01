@@ -112,6 +112,10 @@ class FallGuardSimulator:
         self.j_peak = 0.0
         self.axis_history = []  # stores (rx, ry, rz)
         self.events = []  # (t_ms, event_name)
+        self.valid_candidate_active = False
+        self.bad_sample_streak = 0
+        self.fault_detect_samples = 0
+        self.first_good_sample_time = 0
 
     def compute_T_s(self) -> float:
         """Adaptive stillness window."""
@@ -169,21 +173,47 @@ class FallGuardSimulator:
 
             v_k_sample = 1.0 if (mag_ok and axis_ok and delta_ok and timing_ok) else 0.0
             current_vk = v_k_sample
+
+            if not self.sensor_fault:
+                if current_vk < 0.5:
+                    self.bad_sample_streak += 1
+                else:
+                    self.bad_sample_streak = 0
+            else:
+                if current_vk > 0.5:
+                    if self.first_good_sample_time == 0:
+                        self.first_good_sample_time = t_ms
+                else:
+                    self.first_good_sample_time = 0
+
             self.Q = 0.9 * self.Q + 0.1 * v_k_sample
 
             # Hysteresis state transitions
             if not self.sensor_fault and self.Q < 0.5:
                 self.sensor_fault = True
+                self.fault_detect_samples = self.bad_sample_streak
                 self.events.append((t_ms, "SENSOR_FAULT"))
-                if self.state in ("FREE_FALL", "IMPACT"):
+                if self.valid_candidate_active and self.state in ("FREE_FALL", "IMPACT", "CANDIDATE_FALL"):
                     self.events.append((t_ms, "POSSIBLE_FALL_DURING_FAULT"))
+                # Reset candidate to NORMAL on entering fault
+                if self.state in ("FREE_FALL", "IMPACT", "CANDIDATE_FALL"):
+                    self.state = "NORMAL"
+                self.valid_candidate_active = False
+
             elif self.sensor_fault and self.Q > 0.9:
                 self.sensor_fault = False
                 self.events.append((t_ms, "SENSOR_RECOVERED"))
+                if self.state in ("FREE_FALL", "IMPACT", "CANDIDATE_FALL"):
+                    self.state = "NORMAL"
+                self.valid_candidate_active = False
 
         # ── 2. Windowed Energy Update ──
         if current_vk > 0.5:
             self.E_k = 0.98 * self.E_k + 0.02 * ((mag - 9.81) ** 2)
+
+        # Requirement 1: Do not feed invalid samples (v_k = 0) to state machine. Hold state instead.
+        if self.USE_INTEGRITY and (current_vk < 0.5 or self.sensor_fault):
+            return
 
         # ── 3. State Machine ──
         is_still = (self.STILL_LOW <= mag <= self.STILL_HIGH)
@@ -199,6 +229,7 @@ class FallGuardSimulator:
                 self.stillness_start_ms = 0
                 self.a_peak = mag
                 self.j_peak = jerk
+                self.valid_candidate_active = True
                 self.events.append((t_ms, "IMPACT_PATH2"))
                 return
 
@@ -206,6 +237,7 @@ class FallGuardSimulator:
             if mag < self.FREE_FALL_MAG:
                 self.state = "FREE_FALL"
                 self.free_fall_start_ms = t_ms
+                self.valid_candidate_active = True
                 self.events.append((t_ms, "FREE_FALL_ENTER"))
 
         elif self.state == "FREE_FALL":
@@ -221,8 +253,10 @@ class FallGuardSimulator:
                     self.events.append((t_ms, "FREE_FALL_QUALIFIED"))
                 else:
                     self.state = "NORMAL"
+                    self.valid_candidate_active = False
             elif ff_dur > self.FF_WINDOW_MS:
                 self.state = "NORMAL"
+                self.valid_candidate_active = False
 
         elif self.state == "IMPACT":
             self.a_peak = max(self.a_peak, mag)
@@ -232,12 +266,14 @@ class FallGuardSimulator:
                 if self.USE_GNB:
                     self.theta = min(self.THETA_MAX, self.theta + self.THETA_UP)
                 self.state = "NORMAL"
+                self.valid_candidate_active = False
                 self.events.append((t_ms, "CANCEL_USER_IMPACT"))
                 return
 
             time_since_impact = t_ms - self.impact_time_ms
             if time_since_impact >= 5000 and not is_still:
                 self.state = "NORMAL"
+                self.valid_candidate_active = False
                 self.events.append((t_ms, "IMPACT_TIMEOUT_MOVING"))
                 return
 
@@ -385,15 +421,43 @@ def test_2_sensor_fault_zero_mag(constants: dict):
     event_names = [e[1] for e in sim.events]
     assert "SENSOR_FAULT" in event_names
     assert "FALL_CONFIRMED" not in event_names
+    assert "POSSIBLE_FALL_DURING_FAULT" not in event_names, "Unplug from NORMAL must not falsely trigger POSSIBLE_FALL_DURING_FAULT"
+    assert "FREE_FALL_ENTER" not in event_names, "Invalid samples must be held and not enter FREE_FALL"
 
-    # Continue feeding zero magnitude and attempt to trigger fall
+    # Continue feeding zero magnitude: state must be held, no fall triggers
     for _ in range(50):
         sim.step(t, mag=0.0, jerk=0.0, raw_axes=(0, 0, 0))
         t += 20
 
     assert "FALL_CONFIRMED" not in [e[1] for e in sim.events]
     assert "ALERT_SENT" not in [e[1] for e in sim.events]
+    assert "FREE_FALL_ENTER" not in [e[1] for e in sim.events]
+
+    # Sub-test: Valid candidate started from VALID samples, then unplugged -> must log POSSIBLE_FALL_DURING_FAULT
+    sim2 = FallGuardSimulator(constants, flag_overrides={"USE_INTEGRITY": 1})
+    t2 = 0
+    # Step in valid normal motion
+    for _ in range(10):
+        sim2.step(t2, mag=9.81, jerk=10.0)
+        t2 += 20
+    # Enter valid free-fall with valid samples
+    for _ in range(3):
+        sim2.step(t2, mag=2.5, jerk=10.0)
+        t2 += 20
+    assert sim2.state == "FREE_FALL"
+    assert sim2.valid_candidate_active is True
+
+    # Now sensor fails (zero mag / i2c disconnect)
+    for _ in range(25):
+        sim2.step(t2, mag=0.0, jerk=0.0, raw_axes=(0, 0, 0))
+        t2 += 20
+    assert sim2.sensor_fault is True
+    assert "POSSIBLE_FALL_DURING_FAULT" in [e[1] for e in sim2.events]
+    assert sim2.state == "NORMAL", "Candidate must be reset to NORMAL upon entering SENSOR_FAULT"
+
     print(f"  [PASS] Zero magnitude caused Q decay (Q={sim.Q:.3f} < 0.5) and SENSOR_FAULT.")
+    print("         POSSIBLE_FALL_DURING_FAULT suppressed for unplug from NORMAL.")
+    print("         POSSIBLE_FALL_DURING_FAULT correctly logged when candidate was active from valid samples.")
     print("         FALL_CONFIRMED was completely suppressed.")
 
 
