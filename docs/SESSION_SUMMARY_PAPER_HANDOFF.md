@@ -144,8 +144,8 @@ In strict compliance with zero-fabrication rules, results are reported in **two 
 
 ---
 
-### Table 2: `[OFFLINE]` SisFall Clinical Benchmark (Waist Belt, 8 Subjects, 1,038 Trials)
-*Dataset: 448 Falls, 590 ADLs, 3.22 Hours of ADL exposure across 5 Young + 3 Elderly adults*
+### Table 2: `[OFFLINE]` SisFall Clinical Benchmark (Waist Belt, 9 Subjects, 1,038 Trials)
+*Dataset: 448 Falls, 590 ADLs, 3.22 Hours of ADL exposure across 5 Young (SA01, SA05, SA10, SA15, SA20) + 4 Elderly (SE01, SE06, SE10, SE15) adults*
 
 | Metric | FallGuard_v2 (Accel-Only) | Bourke SVM (2007) | Noury TwoStage (2007) | Li GyroTilt (2009) |
 | :--- | :---: | :---: | :---: | :---: |
@@ -196,7 +196,7 @@ In strict compliance with zero-fabrication rules, results are reported in **two 
 | # | Reviewer Comment | Recommended Revision & Response |
 | :---: | :--- | :--- |
 | **1** | *"Novelty is unclear; looks like standard thresholding."* | Highlight the **SIA-ATV** framework: continuous Sensor Quality Index $Q(t)$ fault gating, energy-adaptive stillness windows $T_s(E_k)$, and lifelong GNB classification with variance flooring. |
-| **2** | *"Sample size is too small (one participant, few trials)."* | Honestly report the $N=20$ hardware pilot results with Wilson 95% CIs, and supplement with the 1,038-trial SisFall clinical benchmark across 8 subjects (5 young, 3 elderly). |
+| **2** | *"Sample size is too small (one participant, few trials)."* | Honestly report the $N=20$ hardware pilot results with Wilson 95% CIs, and supplement with the 1,038-trial SisFall clinical benchmark across 9 subjects (5 young, 4 elderly). |
 | **3** | *"Provide event-level metrics with confidence intervals."* | Report Sensitivity, Specificity, Precision, F1, Accuracy, exposure-based FA/hour, and Latency with Wilson 95% CIs. |
 | **4** | *"Compare with established baseline algorithms."* | Implement and benchmark against Bourke SVM (2007), Noury TwoStage (2007), and Li GyroTilt (2009) on 1,038 standardized SisFall trials. |
 | **5** | *"Evaluate sensor faults and reliability."* | Present the 3 physical hardware unplug trials demonstrating 100% detection of `SENSOR_FAULT` ($Q=0.48$), 100% recovery, and 0 false fall alarms. |

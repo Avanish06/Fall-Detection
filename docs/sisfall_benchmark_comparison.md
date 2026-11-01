@@ -27,8 +27,8 @@ This evaluation presents a comprehensive, empirical comparative assessment of th
    - **Detection Latency**: **3314.6 ± 332.5 ms** relative to physical impact peak ($N=5$ True Positives).
    - *Baseline Status*: Literature baselines (Bourke SVM, Noury TwoStage, Li GyroTilt) were not deployed to embedded ESP32 hardware during the pilot 1 protocol; per Zero-Fabrication Requirement R5, baseline metrics on hardware are honestly reported as `N/A (Not deployed to hardware)`.
 
-2. **`[OFFLINE]` SisFall Clinical Motion Benchmark (Pelvic Waist Belt, 8 Participants, 1,038 Trials, 50 Hz)**:
-   - Evaluated across 1,038 standardized SisFall trials (448 Falls, 590 ADLs, 3.22 hours of ADL exposure) spanning 5 young and 3 elderly subjects.
+2. **`[OFFLINE]` SisFall Clinical Motion Benchmark (Pelvic Waist Belt, 9 Participants, 1,038 Trials, 50 Hz)**:
+   - Evaluated across 1,038 standardized SisFall trials (448 Falls, 590 ADLs, 3.22 hours of ADL exposure) spanning 5 young and 4 elderly subjects.
    - **FallGuard_v2 (Accelerometer-Only)**:
      - **Sensitivity**: **78.35% [74.30%, 81.91%]** (351/448 falls detected).
      - **Specificity**: **85.93% [82.89%, 88.51%]** (507/590 ADLs rejected).
@@ -59,7 +59,7 @@ This evaluation presents a comprehensive, empirical comparative assessment of th
 +--------------------------------------------------------------------------------------------------+
 
 +--------------------------------------------------------------------------------------------------+
-| QUICK REFERENCE CARD: [OFFLINE] SISFALL BENCHMARK (Pelvic Waist Belt, 8 Subjects, 1038 Trials)   |
+| QUICK REFERENCE CARD: [OFFLINE] SISFALL BENCHMARK (Pelvic Waist Belt, 9 Subjects, 1038 Trials)   |
 +--------------------------------------------------------------------------------------------------+
 | FallGuard_v2 (Accel Only)   : Sens=78.35% [74.30%, 81.91%] | Spec=85.93% [82.89%, 88.51%] | Prec=80.88% [76.91%, 84.30%] | F1=0.7959 | FA/hr=25.79 |
 | Baseline_GyroTilt (Li 2009) : Sens=91.74% [88.82%, 93.95%] | Spec=91.69% [89.19%, 93.66%] | Prec=89.35% [86.20%, 91.85%] | F1=0.9053 | FA/hr=15.22 |
@@ -81,9 +81,9 @@ This evaluation presents a comprehensive, empirical comparative assessment of th
 
 ### 2.2 `[OFFLINE]` SisFall Benchmark Dataset & Preprocessing
 - **Dataset Origin**: Publicly accessible SisFall motion dataset (Kwolek et al., Universidad de Antioquia), a clinical benchmark for fall detection evaluation.
-- **Subject Demographics (8 Representative Participants)**:
-  - 5 Young Adults: `SA01`, `SA05`, `SA10`, `SA15`, `SA20` (ages 19–30, high physical agility).
-  - 3 Elderly Adults: `SE01`, `SE06`, `SE10` (ages 60–75, representing target geriatric clinical demographic).
+- **Subject Demographics (9 Representative Participants: 5 Young, 4 Elderly)**:
+  - 5 Young Adults: `SA01`, `SA05`, `SA10`, `SA15`, `SA20` (ages 19–30, high physical agility; 761 trials total).
+  - 4 Elderly Adults: `SE01`, `SE06`, `SE10`, `SE15` (ages 60–75, representing target geriatric clinical demographic; 277 trials total, with SE15 contributing D17 vehicle egress trials).
 - **Scope & Activity Spectrum**:
   - Total evaluated trials: 1,038 trials per detector.
   - Falls: 448 trials across 15 distinct fall types (`F01`–`F15`: slips, trips, faints, forward, backward, lateral, obstacle collapses).
@@ -212,7 +212,7 @@ Below is the verbatim log of all $N=20$ discrete physical trials recorded during
 ## Section 4: `[OFFLINE]` Table & Analysis (SisFall 1,038 Trials Across 4 Detectors)
 
 ### 4.1 Primary SisFall Benchmark Table
-### Table 2: [OFFLINE] SisFall Benchmark Results (Waist Placement, 8 Participants, 1,038 Trials)
+### Table 2: [OFFLINE] SisFall Benchmark Results (Waist Placement, 9 Participants, 1,038 Trials)
 
 | Metric | FallGuard_v2 | Baseline_SVM (Bourke 2007) | Baseline_TwoStage (Noury 2007) | Baseline_GyroTilt (Li 2009) |
 | :--- | :---: | :---: | :---: | :---: |
@@ -256,7 +256,7 @@ Below is the verbatim log of all $N=20$ discrete physical trials recorded during
    - This confirms that FallGuard's 5-point SMA filtering, dual-path jerk gating, and post-impact adaptive stillness accumulator provide substantial protection against dynamic false alarms without requiring power-hungry gyroscope sensing.
 
 ### 4.3 Demographic Cohort Breakdown: Young Adults vs Elderly Adults
-SisFall evaluated participants across two demographic cohorts: Young Adults (`SA01`–`SA20`, 5 subjects) and Elderly Adults (`SE01`–`SE10`, 3 subjects). Below is the empirical performance breakdown:
+SisFall evaluated participants across two demographic cohorts: Young Adults (`SA01`–`SA20`, 5 subjects, 761 trials) and Elderly Adults (`SE01`–`SE15`, 4 subjects, 277 trials). Below is the empirical performance breakdown:
 
 | Demographic Group | Fall Detector | Total Trials | TP | FN | TN | FP | Sensitivity | Specificity | F1-Score |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -419,7 +419,7 @@ The integrity of all inputs, outputs, firmware, and evaluation scripts is attest
 | `data/sisfall/manifest.csv` | Input (SisFall Catalog) | 1,038 trials | `dfe2ef10dcf15ffeb275a80d5a340f6e03c3fa6d02ff0f2412bed30ca70daef5` |
 | `results/offline_sisfall_benchmark.csv` | Input (SisFall Benchmark) | 4,152 evaluations | `386aa40e21bf1777704112f592504881ea32fe13d62912df50cc04b08005ff82` |
 | `firmware/FallGuard_v2.ino` | Source (ESP32 Firmware) | Production C++ | `f6ec1eaef09ee0dc8dbbe4cb19d8835caac2e7dd397f501cbc9bc88cf4564b9d` |
-| `tools/generate_comparison_report.py` | Engine (Report Generator) | Python 3 | `5813e1e170f5fe040539ca274ab8b476db37c03d2f5a05d6d11de6d548219c4f` |
+| `tools/generate_comparison_report.py` | Engine (Report Generator) | Python 3 | `dcac181af1056710bd91fe0a06baa9c0377b325c8532396759f9af9f093e3166` |
 
 ### 6.3 Independent Verification & Reproducibility Guide
 To independently re-verify all calculations, tables, and assertions in this report, execute the following commands in PowerShell from the repository root:
